@@ -1,0 +1,30 @@
+# must have configs
+n_clusters: 1
+save_mode: 'save_png'
+
+# encoder configs
+n_components: 2
+domain_size: 0.03
+
+# classifier configs
+
+# model configs
+in_channels: 4
+out_channels: 4
+width: 43
+num_powers: 3
+retrieve_weight: False
+# latent_dim: 128
+# message_passing_steps: 10
+# nmlp_layers: 2
+# mlp_hidden_dim: 128
+num_layers: 5
+
+# data configs
+root: 'data/Duct'
+partition: True
+sub_size: 4000
+
+# pred configs
+idxs: [1, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 360, 390]
+timesteps: 20

@@ -1,0 +1,31 @@
+# must have configs
+n_clusters: 2
+save_mode: 'save_png'
+
+# encoder configs
+n_components: 20
+domain_size: 0.1963495
+
+# classifier configs
+
+# model configs
+in_channels: 3
+out_channels: 1
+width: 20
+latent_dim: 128
+message_passing_steps: 10
+nmlp_layers: 2
+mlp_hidden_dim: 128
+
+# data configs
+root: 'data/jhtdb_transition_bc'
+tstart: 1
+tend: 500
+fields: 'u'
+dataset: 'transition_bl'
+partition: True
+sub_size: 12
+
+# pred configs
+idxs: [1, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 360, 390, 420, 450, 480]
+timesteps: 20

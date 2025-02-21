@@ -1,0 +1,27 @@
+# must have configs
+n_clusters: 2
+save_mode: 'save_png'
+
+# encoder configs
+n_components: 20
+domain_size: 0.1963495
+
+# classifier configs
+
+# model configs
+in_channels: 8
+out_channels: 8
+width: 20
+
+# data configs
+root: 'data/jhtdb_isotropic1024'
+tstart: 1
+tend: 1000
+fields: 'u'
+dataset: 'isotropic1024coarse'
+partition: True
+sub_size: 12
+
+# pred configs
+idxs: [100]
+timesteps: 4
