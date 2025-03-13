@@ -12,12 +12,22 @@ pip install -r requirements.txt
 
 Training and prediction on the framework can be done by running the python script in the project folder. An example using the duct geometry dataset, and neural operator (NO) is shown below:
 ```bash
-python run_DS_3D.py --dataset=duct --model=neuralop --mode=train
+python run_DS_3D.py --mode=train
 ```
 
 After excuting the above command, the model will be trained on the duct dataset. To predict the results, run the following command:
 ```bash
-python run_DS_3D.py --dataset=duct --model=neuralop --mode=predict
+python run_DS_3D.py --mode=predict
 ```
 
 All results will be saved to the `./logs` folder.
+
+## Configurations
+Several other models are also available in the `models` folder. To use a different model, change the `model` parameter when submitting the python script. Logging folders can also be specified. For example, to train a neural operator (NO) model, use the following command:
+```bash
+python run_DS_3D.py --mode=train --model=neuralop --exp_name=duct_neuralop
+```
+And a similar command to predict the results:
+```bash
+python run_DS_3D.py --mode=predict --model=neuralop --exp_name=duct_neuralop
+```
