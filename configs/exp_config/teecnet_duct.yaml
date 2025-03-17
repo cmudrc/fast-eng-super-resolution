@@ -21,7 +21,7 @@ retrieve_weight: False
 num_layers: 5
 
 # data configs
-root: 'data/Duct'
+root: 'data'
 partition: True
 sub_size: 4000
 

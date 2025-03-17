@@ -22,6 +22,9 @@ python run_DS_3D.py --mode=predict
 
 All results will be saved to the `./logs` folder.
 
+## Dataset
+The duct dataset in the paper is NOT included in this repository due to copyright reasons. However, the code can be easily adapted to other ANSYS Fluent simulation results. ANSYS mesh files `.msh` and Fluent output summary binary files are required for the training and prediction. Place the raw data in the `./data/raw` folder. Specify raw data file names in the `./dataset/GraphDataset.py` file, and the code should be able to process the data automatically.
+
 ## Configurations
 Several other models are also available in the `models` folder. To use a different model, change the `model` parameter when submitting the python script. Logging folders can also be specified. For example, to train a neural operator (NO) model, use the following command:
 ```bash
