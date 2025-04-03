@@ -1,6 +1,9 @@
 import os
 # os.environ['HDF5_DISABLE_VERSION_CHECK'] = '2' # Only add this for TRACE to work, comment out for other cases! 
 import time
+import meshio
+from fenics import *
+from dolfin import *
 import torch
 import numpy as np
 from scipy.spatial import KDTree
@@ -8,6 +11,7 @@ from joblib import Parallel, delayed
 import tqdm
 import vtk
 from vtk import vtkFLUENTReader
+from vtkmodules.util.numpy_support import vtk_to_numpy, numpy_to_vtk
 from collections import deque
 import pandas as pd
 import multiprocessing as mp
@@ -690,7 +694,248 @@ class DuctAnalysisDataset(GenericGraphDataset):
         
         reconstructed_mesh = append_filter.GetOutput()
 
+        # smooth the velocity field
+        # reconstructed_mesh = self.smooth_velocity_field(reconstructed_mesh)
+
         return reconstructed_mesh
+    
+    @staticmethod
+    def extract_mesh_and_velocity(vtk_grid):
+        """
+        Extract mesh and velocity from vtk unstructured grid without file I/O
+        """
+        print("Extracting mesh and velocity data...")
+        
+        # Get mesh points
+        vtk_points = vtk_grid.GetPoints()
+        points = vtk_to_numpy(vtk_points.GetData())
+        
+        # Get mesh cells (assuming tetrahedral elements)
+        cells = []
+        cell_types = []
+        n_cells = vtk_grid.GetNumberOfCells()
+        
+        for i in range(n_cells):
+            cell = vtk_grid.GetCell(i)
+            cell_type = cell.GetCellType()
+            
+            # Get point IDs for this cell
+            point_ids = [cell.GetPointId(j) for j in range(cell.GetNumberOfPoints())]
+            cells.append(point_ids)
+            cell_types.append(cell_type)
+        
+        # Find velocity field
+        velocity_array = None
+        velocity_name = None
+        
+        point_data = vtk_grid.GetPointData()
+        for i in range(point_data.GetNumberOfArrays()):
+            array_name = point_data.GetArrayName(i)
+            if "velocity" in array_name.lower() or "vel" in array_name.lower():
+                velocity_array = vtk_to_numpy(point_data.GetArray(i))
+                velocity_name = array_name
+                break
+        
+        if velocity_array is None:
+            raise ValueError("Velocity field not found in VTK grid")
+        
+        print(f"Extracted {len(points)} points, {len(cells)} cells, and velocity data.")
+        return points, cells, cell_types, velocity_array, velocity_name
+
+    @staticmethod
+    def create_fenics_mesh(points, cells, cell_types):
+        """
+        Create a FEniCS mesh directly from point and cell data
+        """
+        print("Creating FEniCS mesh...")
+        
+        # Filter tetrahedral cells (VTK cell type 10)
+        tetra_cells = []
+        for i, cell_type in enumerate(cell_types):
+            if cell_type == 10:  # VTK_TETRA
+                tetra_cells.append(cells[i])
+        
+        # Create mesh in memory
+        comm = MPI.COMM_WORLD
+        editor = MeshEditor()
+        mesh = Mesh(comm)
+        
+        # Determine mesh dimension (2D or 3D)
+        gdim = points.shape[1]
+        tdim = 3 if cell_type == 10 else 2
+        
+        # Initialize mesh
+        editor.open(mesh, "tetrahedron" if tdim == 3 else "triangle", tdim, gdim)
+        
+        # Add vertices
+        editor.init_vertices(len(points))
+        for i, point in enumerate(points):
+            editor.add_vertex(i, point)
+        
+        # Add cells
+        editor.init_cells(len(tetra_cells))
+        for i, cell in enumerate(tetra_cells):
+            editor.add_cell(i, cell)
+        
+        editor.close()
+        
+        print(f"Created FEniCS mesh with {mesh.num_vertices()} vertices and {mesh.num_cells()} cells.")
+        return mesh
+
+    @staticmethod
+    def create_fenics_velocity(mesh, velocity_array):
+        """
+        Map velocity data to FEniCS function space
+        """
+        print("Mapping velocity data to FEniCS function space...")
+        
+        # Create function space for velocity
+        V = VectorFunctionSpace(mesh, "CG", 2)
+        
+        # Create velocity function
+        v = Function(V)
+        
+        # Map velocity data to function
+        # This is a simplified approach - for complex meshes, proper interpolation is needed
+        v_values = v.vector().get_local()
+        
+        # Get vertex to dof map for direct assignment
+        dofmap = V.dofmap()
+        vertex_to_dof = vertex_to_dof_map(V)
+        
+        # Assign velocity values to dofs
+        for i in range(len(velocity_array)):
+            dof_indices = vertex_to_dof[i]
+            for d in range(len(velocity_array[i])):
+                v_values[dof_indices[d]] = velocity_array[i][d]
+        
+        v.vector().set_local(v_values)
+        
+        print("Mapped velocity data to FEniCS function.")
+        return v, V
+
+    @staticmethod
+    def smooth_velocity_field_in_memory(mesh, v_original, V):
+        """
+        Apply continuity-based smoothing to the velocity field in memory
+        """
+        print("Applying continuity-based smoothing...")
+        
+        # Define function spaces for pressure
+        Q = FunctionSpace(mesh, "CG", 1)  # Pressure space
+        
+        # Define trial and test functions
+        v = TrialFunction(V)
+        p = TrialFunction(Q)
+        phi_v = TestFunction(V)
+        phi_p = TestFunction(Q)
+        
+        # Define smoothing parameters
+        alpha = Constant(1.0e-2)  # Smoothing weight
+        
+        # Create bilinear and linear forms for the smoothing problem
+        a_v = (inner(v, phi_v) * dx + 
+            alpha * inner(grad(v), grad(phi_v)) * dx)
+        L_v = inner(v_original, phi_v) * dx
+        
+        # Solve the initial smoothing problem
+        v_smooth = Function(V)
+        solve(a_v == L_v, v_smooth)
+        
+        # Now enforce the divergence-free constraint using a projection method
+        # Define the pressure Poisson problem
+        a_p = inner(grad(p), grad(phi_p)) * dx
+        L_p = inner(div(v_smooth), phi_p) * dx
+        
+        # Solve the pressure Poisson equation
+        p = Function(Q)
+        solve(a_p == L_p, p)
+        
+        # Project to make the velocity field divergence-free
+        v_projected = project(v_smooth - grad(p), V)
+        
+        print("Smoothing completed.")
+        return v_projected
+
+    @staticmethod
+    def extract_smoothed_velocity(mesh, v_smooth, num_points):
+        """
+        Extract smoothed velocity values at original mesh points
+        """
+        print("Extracting smoothed velocity values...")
+        
+        # Get vertex to dof map
+        V = v_smooth.function_space()
+        vertex_to_dof = vertex_to_dof_map(V)
+        
+        # Extract velocity values at mesh vertices
+        smoothed_velocity = np.zeros((num_points, 3))
+        
+        # Extract values at vertices
+        for i in range(num_points):
+            if i < len(vertex_to_dof):
+                dofs = vertex_to_dof[i]
+                for d in range(min(3, len(dofs))):
+                    smoothed_velocity[i, d] = v_smooth.vector()[dofs[d]]
+        
+        print("Extracted smoothed velocity values.")
+        return smoothed_velocity
+
+    def update_vtk_grid(vtk_grid, smoothed_velocity, velocity_name):
+        """
+        Update the VTK grid with smoothed velocity data
+        """
+        print("Updating VTK grid with smoothed velocity...")
+        
+        # Convert smoothed velocity to VTK array format
+        vtk_velocity = numpy_to_vtk(smoothed_velocity)
+        vtk_velocity.SetName(velocity_name)
+        
+        # Replace the velocity field in the original data
+        vtk_grid.GetPointData().RemoveArray(velocity_name)
+        vtk_grid.GetPointData().AddArray(vtk_velocity)
+        
+        # Add a new array for the smoothed velocity
+        smoothed_name = f"Smoothed_{velocity_name}"
+        vtk_velocity_copy = numpy_to_vtk(smoothed_velocity.copy())
+        vtk_velocity_copy.SetName(smoothed_name)
+        vtk_grid.GetPointData().AddArray(vtk_velocity_copy)
+        
+        print("VTK grid updated with smoothed velocity.")
+        return vtk_grid
+
+
+    def smooth_vtu_with_continuity(self, vtk_grid):
+        """
+        Main function to smooth VTU data with continuity constraint in-memory
+        """
+        try:
+            # Step 1: Extract mesh and velocity data from VTK grid without file I/O
+            points, cells, cell_types, velocity_array, velocity_name = self.extract_mesh_and_velocity(vtk_grid)
+            
+            # Step 2: Create FEniCS mesh directly from point and cell data
+            fenics_mesh = self.create_fenics_mesh(points, cells, cell_types)
+            
+            # Step 3: Map velocity data to FEniCS function space
+            v_original, V = self.create_fenics_velocity(fenics_mesh, velocity_array)
+            
+            # Step 4: Apply continuity-based smoothing in memory
+            v_smooth = self.smooth_velocity_field_in_memory(fenics_mesh, v_original, V)
+            
+            # Step 5: Extract smoothed velocity values at original mesh points
+            smoothed_velocity = self.extract_smoothed_velocity(fenics_mesh, v_smooth, len(points))
+            
+            # Step 6: Update the VTK grid with smoothed velocity data
+            updated_vtk_grid = self.update_vtk_grid(vtk_grid, smoothed_velocity, velocity_name)
+            
+            print("Successfully smoothed velocity field with continuity constraint")
+            return updated_vtk_grid
+            
+        except Exception as e:
+            print(f"Error: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     
     def get_one_full_sample(self, idx):

@@ -11,7 +11,6 @@ import yaml
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import wandb
-from numba import jit
 import vtk
 
 
@@ -61,51 +60,6 @@ def parse_args():
     parser.add_argument('--train_config', type=str, default='configs/train_config/teecnet.yaml', help='Path to the training configuration file')
     args = parser.parse_args()
     return args
-
-
-@jit(nopython=True)
-def compute_tke_spectrum(u, lx, ly):
-    """
-    Given velocity fields u and v, computes the turbulent kinetic energy spectrum. The function computes in three steps:
-    1. Compute velocity spectrum with fft, returns uf, vf.
-    2. Compute the point-wise turbulent kinetic energy Ef=0.5*(uf, vf)*conj(uf, vf).
-    3. For every wave number triplet (kx, ky, kz) we have a corresponding spectral kinetic energy 
-    Ef(kx, ky, kz). To extract a one dimensional spectrum, E(k), we integrate Ef(kx,ky,kz) over
-    the surface of a sphere of radius k = sqrt(kx^2 + ky^2 + kz^2). In other words
-    E(k) = sum( E(kx,ky,kz), for all (kx,ky,kz) such that k = sqrt(kx^2 + ky^2 + kz^2) ).
-    """
-    nx = u.shape[0]
-    ny = u.shape[1]
-
-    nt = nx * ny
-    # Compute velocity spectrum
-    uf = torch.fft.fftn(u, norm='ortho')
-
-    # Compute the point-wise turbulent kinetic energy
-    Ef = 0.5 * (uf * torch.conj(uf)).real
-    kx = 2 * torch.pi / lx 
-    ky = 2 * torch.pi / ly
-    knorm = np.sqrt(kx ** 2 + ky ** 2)
-    kxmax = nx / 2
-    kymax = ny / 2
-    wave_numbers = knorm * torch.arange(0, nx)
-    tke_spectrum = torch.zeros(nx)
-    for i in range(nx):
-        rkx = i
-        if i > kxmax:
-            rkx = rkx - nx
-        for j in range(ny):
-            rky = j
-            if j > kymax:
-                rky = rky - ny
-            rk = np.sqrt(rkx * rkx + rky * rky)
-            k_index = int(np.round(rk))
-            tke_spectrum[k_index] += Ef[i, j]
-    # k = torch.fft.fftfreq(nx, lx / nx)
-
-    # plt.loglog(wave_numbers[1:], tke_spectrum[1:])
-    # plt.savefig('tke_spectrum.png')
-    return tke_spectrum[1:], wave_numbers[1:]
 
 
 def save_pyg_to_vtk(data, mesh_path, save_path):
