@@ -193,8 +193,16 @@ class GNNPartitionScheduler():
             model.eval()
             with torch.no_grad():
                 if torch.cuda.device_count() > 1:
-                    if not mp.get_start_method(allow_none=True) == 'spawn':
-                        mp.set_start_method('spawn')
+                    try:
+                        # Check if start method is already set
+                        current_method = mp.get_start_method(allow_none=True)
+                        if current_method is None:
+                            # Only set if not already set
+                            mp.set_start_method('spawn', force=False)
+                    except RuntimeError:
+                        # If we can't set it, just use whatever is already set
+                        pass
+                    
                     # split the list of x into chunks and predict in parallel
                     world_size = torch.cuda.device_count()
                     print(f'Using {world_size} GPUs')
