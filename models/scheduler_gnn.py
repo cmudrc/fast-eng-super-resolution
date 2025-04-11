@@ -263,6 +263,7 @@ class GNNPartitionScheduler():
         dist.destroy_process_group()
         # pred_y_list = torch.cat(pred_y_list, dim=0)
         results[rank] = pred_y_list
+        return pred_y_list
                  
     @staticmethod
     def _train_sub_models_parallel(rank, model, name, world_size, train_dataset, val_dataset, train_config):

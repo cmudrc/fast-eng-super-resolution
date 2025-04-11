@@ -3,8 +3,6 @@ import os
 import time
 
 from numba import prange, njit
-from fenics import *
-from dolfin import *
 import torch
 import numpy as np
 from scipy.spatial import KDTree
@@ -13,9 +11,10 @@ import vtk
 from vtk import vtkFLUENTReader
 from vtkmodules.util import numpy_support  
 from vtkmodules.numpy_interface import dataset_adapter as dsa
-import pyvista
+import pyvista as pv
+import pyamg
 from scipy.sparse import lil_matrix, csr_matrix
-from scipy.sparse.linalg import spsolve, bicgstab, gmres
+from scipy.sparse.linalg import spsolve, bicgstab, gmres, cg
 import pandas as pd
 import multiprocessing as mp
 import torch_geometric as pyg
@@ -23,6 +22,7 @@ from torch_geometric.data import Data, InMemoryDataset
 # from torch_geometric.loader import DataLoader
 from torch_geometric.utils import subgraph
 import h5py
+import matplotlib.pyplot as plt
 
 from tqdm import tqdm
 
@@ -734,15 +734,14 @@ class DuctAnalysisDataset(GenericGraphDataset):
             Updated VTK grid with smoothed velocity
         """
         try:
-            projector = DivergenceFreeProjection(vtk_grid, velocity_array_name="velocity", pressure_array_name="pressure")
+            projector = DivergenceFreeProjection(vtk_grid)
             initial_divergence = projector.calculate_divergence()
 
             print(f"Initial divergence: {initial_divergence}")
 
             corrected_velocity, corrected_pressure, final_div_norm, iterations = projector.apply_divergence_free_projection(
                 max_iterations=20,
-                tolerance=1e-2,
-                pressure_solver_tol=1e-3
+                tolerance=1e-2
             )
             
             print(f"Final divergence: {final_div_norm} in {iterations} iterations")
@@ -786,593 +785,224 @@ class ProgressObserver:
 
 
 @njit(parallel=True)
-def _calculate_divergence_kernel(velocity, weights_matrix, neighbors_mask, valid_points, n_points):
-    """Numba-optimized kernel for divergence calculation"""
-    divergence = np.zeros(n_points)
-    
+def compute_weights(n_points, points, neighbors_flat, offsets):
+    max_neighbors = np.max(offsets[1:] - offsets[:-1])
+    weights_matrix = np.zeros((n_points, 3, max_neighbors))
+
     for i in prange(n_points):
-        if valid_points[i] == 0:
+        start, end = offsets[i], offsets[i + 1]
+        n_neighbors = end - start
+        if n_neighbors == 0:
             continue
-            
-        # Find the number of valid neighbors
-        n_neighbors = 0
-        for j in range(weights_matrix.shape[2]):
-            if neighbors_mask[i, j] > 0:
-                n_neighbors += 1
+
+        A = np.zeros((n_neighbors, 3))
+        for idx in range(n_neighbors):
+            j = neighbors_flat[start + idx]
+            A[idx, :] = points[j, :] - points[i, :]
+
+        # Check if A is full rank
+        if n_neighbors >= 3:
+            U, S, Vh = np.linalg.svd(A, full_matrices=False)
+            cond_number = S[0] / S[-1] if S[-1] > 1e-12 else 1e16
+
+            if cond_number < 1e12:
+                S_inv = np.where(S > 1e-10, 1.0 / S, 0.0)
+                pinv = (Vh.T * S_inv) @ U.T
+                for idx in range(n_neighbors):
+                    weights_matrix[i, :, idx] = pinv[:, idx]
             else:
-                break
-        
-        # Compute velocity differences and apply weights
-        div_x = 0.0
-        div_y = 0.0
-        div_z = 0.0
-        
-        for j in range(n_neighbors):
-            neighbor_idx = neighbors_mask[i, j]
-            # Velocity difference
-            dx = velocity[neighbor_idx, 0] - velocity[i, 0]
-            dy = velocity[neighbor_idx, 1] - velocity[i, 1]
-            dz = velocity[neighbor_idx, 2] - velocity[i, 2]
-            
-            # Apply weights
-            div_x += weights_matrix[i, 0, j] * dx
-            div_y += weights_matrix[i, 1, j] * dy
-            div_z += weights_matrix[i, 2, j] * dz
-        
-        # Sum components to get divergence
-        divergence[i] = div_x + div_y + div_z
-    
+                weights_matrix[i, :, :n_neighbors] = 1.0 / n_neighbors
+
+        else:
+            # Under-determined system
+            weights_matrix[i, :, :n_neighbors] = 1.0 / n_neighbors
+
+    return weights_matrix
+
+
+@njit(parallel=True)
+def compute_divergence(n_points, velocity, neighbors_flat, offsets, weights_matrix):
+    divergence = np.zeros(n_points)
+    for i in prange(n_points):
+        start, end = offsets[i], offsets[i + 1]
+        n_neighbors = end - start
+        vel_diffs = np.zeros((n_neighbors, 3))
+        for idx in range(n_neighbors):
+            j = neighbors_flat[start + idx]
+            vel_diffs[idx, :] = velocity[j, :] - velocity[i, :]
+        # vel_diffs_T = np.ascontiguousarray(vel_diffs.T)
+        # print(f"vel_diffs shape: {vel_diffs.shape}")
+        # print(f"weights_matrix shape: {weights_matrix[i, :, :n_neighbors].shape}")
+        divergence[i] = np.sum(weights_matrix[i, :, :n_neighbors] @ vel_diffs)
     return divergence
 
 
 @njit(parallel=True)
-def _apply_pressure_gradient_kernel(velocity, pressure, weights_matrix, neighbors_mask, valid_points, n_points):
-    """Numba-optimized kernel for pressure gradient application"""
+def apply_pressure_correction(n_points, velocity, pressure, neighbors_flat, offsets, weights_matrix):
     corrected_velocity = velocity.copy()
-    
     for i in prange(n_points):
-        if valid_points[i] == 0:
-            continue
-            
-        # Find the number of valid neighbors
-        n_neighbors = 0
-        for j in range(weights_matrix.shape[2]):
-            if neighbors_mask[i, j] > 0:
-                n_neighbors += 1
-            else:
-                break
-        
-        # Compute pressure gradient
-        grad_x = 0.0
-        grad_y = 0.0
-        grad_z = 0.0
-        
-        for j in range(n_neighbors):
-            neighbor_idx = neighbors_mask[i, j]
-            # Pressure difference
-            dp = pressure[neighbor_idx] - pressure[i]
-            
-            # Apply weights
-            grad_x += weights_matrix[i, 0, j] * dp
-            grad_y += weights_matrix[i, 1, j] * dp
-            grad_z += weights_matrix[i, 2, j] * dp
-        
-        # Apply pressure gradient correction
-        corrected_velocity[i, 0] -= grad_x
-        corrected_velocity[i, 1] -= grad_y
-        corrected_velocity[i, 2] -= grad_z
-    
+        start, end = offsets[i], offsets[i + 1]
+        n_neighbors = end - start
+        pressure_diffs = np.zeros(n_neighbors)
+        for idx in range(n_neighbors):
+            j = neighbors_flat[start + idx]
+            pressure_diffs[idx] = pressure[j] - pressure[i]
+        grad_p = weights_matrix[i, :, :n_neighbors] @ pressure_diffs
+        corrected_velocity[i, :] -= grad_p
     return corrected_velocity
 
-@njit(parallel=True)
-def _build_laplacian_kernel(points, valid_points, neighbors_mask, n_points, max_neighbors):
-    """
-    Numba-optimized kernel to build the Laplacian matrix data
-    
-    Parameters:
-    -----------
-    points : numpy.ndarray
-        Array of point coordinates, shape (n_points, 3)
-    valid_points : numpy.ndarray
-        Mask indicating which points have valid neighbors
-    neighbors_mask : numpy.ndarray
-        Matrix of neighbor indices, shape (n_points, max_neighbors)
-    n_points : int
-        Number of points in the mesh
-    max_neighbors : int
-        Maximum number of neighbors per point
-    
-    Returns:
-    --------
-    rows : numpy.ndarray
-        Row indices for sparse matrix
-    cols : numpy.ndarray
-        Column indices for sparse matrix
-    data : numpy.ndarray
-        Values for sparse matrix
-    """
-    # Estimate the number of non-zero entries (overestimate)
-    estimated_nnz = n_points + n_points * max_neighbors
-    
-    # Pre-allocate arrays for sparse matrix construction
-    rows = np.zeros(estimated_nnz, dtype=np.int32)
-    cols = np.zeros(estimated_nnz, dtype=np.int32)
-    data = np.zeros(estimated_nnz, dtype=np.float64)
-    
-    # Counter for filling the arrays
-    nnz_count = 0
-    
-    for i in prange(n_points):
-        # For each point, set diagonal element
-        rows[nnz_count] = i
-        cols[nnz_count] = i
-        data[nnz_count] = 1.0  # Will be adjusted later if point has neighbors
-        nnz_count += 1
-        
-        if not valid_points[i]:
-            continue
-        
-        # Find valid neighbors for this point
-        n_valid_neighbors = 0
-        neighbor_indices = np.zeros(max_neighbors, dtype=np.int32)
-        
-        for j in range(max_neighbors):
-            if neighbors_mask[i, j] > 0:
-                neighbor_indices[n_valid_neighbors] = neighbors_mask[i, j]
-                n_valid_neighbors += 1
-            else:
-                break
-        
-        if n_valid_neighbors == 0:
-            continue
-        
-        # Compute weights based on inverse distance
-        weights = np.zeros(n_valid_neighbors, dtype=np.float64)
-        total_weight = 0.0
-        
-        for idx in range(n_valid_neighbors):
-            j = neighbor_indices[idx]
-            # Use inverse distance weighting
-            vec_x = points[j, 0] - points[i, 0]
-            vec_y = points[j, 1] - points[i, 1]
-            vec_z = points[j, 2] - points[i, 2]
-            dist_squared = vec_x*vec_x + vec_y*vec_y + vec_z*vec_z
-            
-            if dist_squared > 1e-12:
-                weight = 1.0 / np.sqrt(dist_squared)
-                weights[idx] = weight
-                total_weight += weight
-        
-        if total_weight > 0:
-            # Set off-diagonal elements (neighbors)
-            for idx in range(n_valid_neighbors):
-                j = neighbor_indices[idx]
-                normalized_weight = weights[idx] / total_weight
-                
-                rows[nnz_count] = i
-                cols[nnz_count] = j
-                data[nnz_count] = -normalized_weight
-                nnz_count += 1
-            
-            # Adjust diagonal element
-            for k in range(nnz_count):
-                if rows[k] == i and cols[k] == i:
-                    data[k] = 1.0
-                    break
-    
-    # Return only the used portion of the arrays
-    return rows[:nnz_count], cols[:nnz_count], data[:nnz_count]
 
+@njit(parallel=True)
+def assemble_laplacian(n_points, neighbors_flat, offsets, weights_matrix):
+    max_nnz = neighbors_flat.shape[0] + n_points  # conservative estimate
+    row_indices = np.empty(max_nnz, dtype=np.int64)
+    col_indices = np.empty(max_nnz, dtype=np.int64)
+    data = np.empty(max_nnz, dtype=np.float64)
+
+    idx = 0
+    for i in prange(n_points):
+        start, end = offsets[i], offsets[i + 1]
+        diag_value = 0.0
+        for k in range(start, end):
+            j = neighbors_flat[k]
+            weight = np.sum(weights_matrix[i, :, k - start])
+            row_indices[idx] = i
+            col_indices[idx] = j
+            data[idx] = -weight
+            idx += 1
+            diag_value += weight
+        row_indices[idx] = i
+        col_indices[idx] = i
+        data[idx] = diag_value
+        idx += 1
+
+    return row_indices[:idx], col_indices[:idx], data[:idx]
 
 class DivergenceFreeProjection:
-    """
-    An optimized class for applying divergence-free projection to velocity fields on unstructured grids
-    """
     def __init__(self, vtk_grid, velocity_array_name="velocity", pressure_array_name="pressure"):
-        """Initialize with a VTK unstructured grid"""
         self.vtk_grid = vtk_grid
         self.velocity_array_name = velocity_array_name
         self.pressure_array_name = pressure_array_name
-        
-        # Convert VTK grid to numpy-friendly wrapper
+
         self.grid = dsa.WrapDataObject(vtk_grid)
-        
-        # Get points and cells
+        self.mesh = pv.wrap(vtk_grid)
         self.points = self.grid.Points
         self.n_points = self.points.shape[0]
-        
-        # Extract velocity field
-        try:
-            self.velocity = self.grid.PointData[velocity_array_name]
-            if self.velocity.shape[1] != 3:
-                raise ValueError(f"Velocity field should have 3 components, but has {self.velocity.shape[1]}")
-        except KeyError:
-            raise KeyError(f"Velocity field '{velocity_array_name}' not found in point data")
-            
-        # Extract or initialize pressure field
-        try:
-            self.pressure = self.grid.PointData[pressure_array_name]
-        except KeyError:
-            print(f"Pressure field '{pressure_array_name}' not found in point data, initializing to zeros")
-            self.pressure = np.zeros(self.n_points)
-        
-        # Build point-to-cell connectivity and other necessary data structures
-        self._build_connectivity()
+        self.cells = self._extract_cells()
 
-    def _compute_boundary_points(self):
-        """Compute boundary points based on neighbor count"""
-        print("Computing boundary points...")
-        start_time = time.time()
-        
-        # Count neighbors for each point
-        neighbor_counts = np.zeros(self.n_points, dtype=np.int32)
-        for i in range(self.n_points):
-            for j in range(self.weights_matrix.shape[2]):
-                if self.neighbors_mask[i, j] > 0:
-                    neighbor_counts[i] += 1
-        
-        # Calculate average number of neighbors
-        valid_counts = neighbor_counts[neighbor_counts > 0]
-        avg_neighbors = np.mean(valid_counts) if len(valid_counts) > 0 else 0
-        
-        # Identify boundary points (points with few neighbors)
-        threshold = 0.2 * avg_neighbors
-        boundary_points = np.zeros(self.n_points, dtype=np.bool_)
-        for i in range(self.n_points):
-            if neighbor_counts[i] > 0 and neighbor_counts[i] < threshold:
-                boundary_points[i] = True
-        
-        print(f"Identified {np.sum(boundary_points)} boundary points in {time.time() - start_time:.2f} seconds")
-        
-        return boundary_points
-        
-    def _build_connectivity(self):
-        """Build connectivity information for the unstructured grid"""
-        print("Building grid connectivity...")
-        start_time = time.time()
-        
-        # Get cell connectivity
-        n_cells = self.vtk_grid.GetNumberOfCells()
-        n_points = self.n_points
-        
-        # Process cells with progress reporting
-        report_interval = max(1, n_cells // 20)
-        
-        # Use arrays to store cell data - more compatible with Numba
-        self.cells = []
-        self.cell_types = []
-        
-        for i in range(n_cells):
-            # Progress reporting
-            if i % report_interval == 0:
-                print(f"Processing cells: {i}/{n_cells} ({100.0 * i / n_cells:.1f}%)")
-                
+        self.velocity = self.grid.PointData[velocity_array_name]
+        self.pressure = self.grid.PointData[pressure_array_name]
+
+        self.point_neighbors, self.offset = self.build_connectivity(self.n_points, self.cells)
+        self.weights_matrix = compute_weights(self.n_points, self.points, self.point_neighbors, self.offset)
+
+    @staticmethod
+    def build_connectivity(n_points, cells):
+        from collections import defaultdict
+        neighbor_sets = defaultdict(set)
+
+        for cell in cells:
+            for i in cell:
+                neighbor_sets[i].update([j for j in cell if j != i])
+
+        neighbor_counts = np.array([len(neighbor_sets[i]) for i in range(n_points)], dtype=np.int64)
+        offsets = np.zeros(n_points + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum(neighbor_counts)
+        neighbors_flat = np.empty(offsets[-1], dtype=np.int64)
+
+        for i in range(n_points):
+            neighbors = list(neighbor_sets[i])
+            neighbors_flat[offsets[i]:offsets[i + 1]] = neighbors
+
+        return neighbors_flat, offsets
+
+    def _extract_cells(self):
+        cells = []
+        print("Total number of cells:", self.vtk_grid.GetNumberOfCells())
+        print("Total number of points:", self.vtk_grid.GetNumberOfPoints())
+        for i in range(self.vtk_grid.GetNumberOfCells()):
             cell = self.vtk_grid.GetCell(i)
-            cell_type = cell.GetCellType()
-            
-            # Get points that form this cell
-            cell_points = []
-            for j in range(cell.GetNumberOfPoints()):
-                cell_points.append(cell.GetPointId(j))
-            
-            self.cells.append(cell_points)
-            self.cell_types.append(cell_type)
-        
-        # Build point-to-cell connectivity
-        self.point_to_cells = [[] for _ in range(n_points)]
-        for cell_idx, cell in enumerate(self.cells):
-            for point_idx in cell:
-                self.point_to_cells[point_idx].append(cell_idx)
-        
-        # Convert to flat array representation for Numba compatibility
-        # For each point, calculate neighbors and store as NumPy arrays
-        self.point_neighbors = []
-        
-        # Report progress for this step too
-        report_interval = max(1, n_points // 20)
-        for i in range(n_points):
-            if i % report_interval == 0:
-                print(f"Building point neighbors: {i}/{n_points} ({100.0 * i / n_points:.1f}%)")
-                
-            # Find all neighbors through cells
-            neighbors = set()
-            for cell_idx in self.point_to_cells[i]:
-                for j in self.cells[cell_idx]:
-                    if j != i:
-                        neighbors.add(j)
-            
-            # Store as NumPy array
-            self.point_neighbors.append(np.array(list(neighbors), dtype=np.int32))
-        
-        # Store flat arrays for Numba
-        neighbors_counts = np.array([len(neighbors) for neighbors in self.point_neighbors], dtype=np.int32)
-        max_neighbors = max(neighbors_counts) if neighbors_counts.size > 0 else 0
-        print(f"Maximum neighbors per point: {max_neighbors}")
-        
-        # Pre-allocate weights matrices for Numba
-        self.weights_matrix = np.zeros((n_points, 3, max_neighbors), dtype=np.float64)
-        self.neighbors_mask = np.zeros((n_points, max_neighbors), dtype=np.int32)
-        
-        print(f"Grid connectivity built in {time.time() - start_time:.2f} seconds")
-        
-        # Compute weights
-        self._compute_weights()
+            cell_points = [cell.GetPointId(j) for j in range(cell.GetNumberOfPoints())]
+            cells.append(np.array(cell_points, dtype=np.int64))
 
-        self.boundary_points = self._compute_boundary_points()
+        # print("Number of unique points in cells:", np.unique(np.concatenate(cells)).shape[0])
+        return cells
 
-    def _compute_weights(self):
-        """Compute weights for gradient and divergence approximation"""
-        print("Computing gradient and divergence weights...")
-        start_time = time.time()
-        
-        # Initialize weights for gradient calculation
-        n_points = self.n_points
-        report_interval = max(1, n_points // 20)
-        
-        # For each point, compute weights for gradient approximation
-        for i in range(n_points):
-            # Progress reporting
-            if i % report_interval == 0:
-                print(f"Computing weights: {i}/{n_points} ({100.0 * i / n_points:.1f}%)")
-                
-            neighbors = self.point_neighbors[i]
-            n_neighbors = len(neighbors)
-            
-            if n_neighbors == 0:
-                # Isolated point, skip
-                continue
-            
-            # Set up least squares problem for gradient
-            A = np.zeros((n_neighbors, 3))
-            for idx, j in enumerate(neighbors):
-                A[idx, 0] = self.points[j, 0] - self.points[i, 0]
-                A[idx, 1] = self.points[j, 1] - self.points[i, 1]
-                A[idx, 2] = self.points[j, 2] - self.points[i, 2]
-            
-            # Solve for weights using pseudo-inverse (least squares)
-            try:
-                # Use SVD for more stable computation
-                U, S, Vh = np.linalg.svd(A, full_matrices=False)
-                # Check for very small singular values that could cause instability
-                S_inv = np.where(S > 1e-10, 1.0 / S, 0.0)
-                pinv = (Vh.T * S_inv) @ U.T
-                
-                # The shape of pinv is (3, n_neighbors)
-                # Store the weights in our pre-allocated arrays
-                for j in range(n_neighbors):
-                    if j < self.weights_matrix.shape[2]:  # Prevent index errors
-                        self.neighbors_mask[i, j] = neighbors[j]
-                        # Access each component directly
-                        self.weights_matrix[i, 0, j] = pinv[0, j]
-                        self.weights_matrix[i, 1, j] = pinv[1, j]
-                        self.weights_matrix[i, 2, j] = pinv[2, j]
-                        
-            except np.linalg.LinAlgError:
-                # Fall back to simple averaging if matrix is singular
-                weight_value = 1.0 / n_neighbors
-                for j in range(n_neighbors):
-                    if j < self.weights_matrix.shape[2]:  # Prevent index errors
-                        self.neighbors_mask[i, j] = neighbors[j]
-                        self.weights_matrix[i, 0, j] = weight_value
-                        self.weights_matrix[i, 1, j] = weight_value
-                        self.weights_matrix[i, 2, j] = weight_value
-        
-        # Create a mask for valid points (those with neighbors)
-        self.valid_points = np.array([len(neighbors) > 0 for neighbors in self.point_neighbors], dtype=np.int32)
-        
-        print(f"Weights computed in {time.time() - start_time:.2f} seconds")
-        print(f"Points with valid weights: {np.sum(self.valid_points)}/{n_points}")
-    
     def calculate_divergence(self):
-        """Calculate divergence of the velocity field"""
-        print("Calculating divergence...")
-        start_time = time.time()
-        
-        # Use the Numba-optimized kernel for calculation
-        divergence = _calculate_divergence_kernel(
-            self.velocity, 
-            self.weights_matrix, 
-            self.neighbors_mask,
-            self.valid_points,
-            self.n_points
-        )
-        
-        print(f"Divergence calculated in {time.time() - start_time:.2f} seconds")
-        print(f"Max absolute divergence: {np.max(np.abs(divergence))}")
-        print(f"Average absolute divergence: {np.mean(np.abs(divergence))}")
-        
-        return divergence
-    
+        return compute_divergence(self.n_points, self.velocity, self.point_neighbors, self.offset, self.weights_matrix)
+
     def build_laplacian_matrix(self):
-        """
-        Build the Laplacian matrix for the unstructured grid using Numba acceleration
-        
-        Returns:
-        --------
-        scipy.sparse.csr_matrix
-            Sparse Laplacian matrix
-        """
-        print("Building Laplacian matrix...")
-        start_time = time.time()
-        
-        # Get dimensionality info needed for Numba kernel
-        n_points = self.n_points
-        max_neighbors = self.weights_matrix.shape[2]
-        
-        # Call the Numba-optimized kernel
-        rows, cols, data = _build_laplacian_kernel(
-            self.points, 
-            self.valid_points, 
-            self.neighbors_mask, 
-            n_points, 
-            max_neighbors
-        )
-        
-        # Create sparse matrix from COO format
-        laplacian = csr_matrix((data, (rows, cols)), shape=(n_points, n_points))
-        
-        print(f"Laplacian matrix built in {time.time() - start_time:.2f} seconds")
-        
-        return laplacian
-    
-    def solve_pressure_poisson(self, divergence, max_iterations=2000, tolerance=1e-5, use_direct_solver=False):
-        """Solve the pressure Poisson equation"""
-        print("Solving pressure Poisson equation...")
-        start_time = time.time()
-        
-        # Build Laplacian matrix
+        rows, cols, data = assemble_laplacian(self.n_points, self.point_neighbors, self.offset, self.weights_matrix)
+        return csr_matrix((data, (rows, cols)), shape=(self.n_points, self.n_points))
+
+    def solve_pressure_poisson(self, divergence, tol=1e-5, maxiter=2000):
         laplacian = self.build_laplacian_matrix()
-        
-        # Prepare right-hand side
-        rhs = -divergence
-        
-        rhs[self.boundary_points] = 0
-        
-        # Solve the system
-        if use_direct_solver:
-            print("Using direct solver...")
-            pressure = spsolve(laplacian, rhs)
-        else:
-            print(f"Using BiCGSTAB iterative solver with tolerance {tolerance}...")
-            pressure, info = bicgstab(laplacian, rhs, rtol=tolerance, maxiter=max_iterations)
-            
-            if info != 0:
-                print(f"Warning: BiCGSTAB did not converge, info = {info}")
-                print("Falling back to GMRES...")
-                pressure, info = gmres(laplacian, rhs, rtol=tolerance, maxiter=max_iterations)
-                
-                if info != 0:
-                    print(f"Warning: GMRES did not converge, info = {info}")
-                    print("Falling back to direct solver...")
-                    pressure = spsolve(laplacian, rhs)
-        
-        print(f"Pressure Poisson equation solved in {time.time() - start_time:.2f} seconds")
-        
+        row_sums = np.abs(laplacian).sum(axis=1).A.flatten()
+        print("Any zero rows in Laplacian:", np.any(row_sums == 0))
+        print("number of zero rows in Laplacian:", np.sum(row_sums == 0))
+        print("Laplacian matrix shape:", laplacian.shape)
+        ml = pyamg.smoothed_aggregation_solver(laplacian)
+        M = ml.aspreconditioner(cycle='V')
+        pressure, info = cg(laplacian, -divergence, rtol=tol, maxiter=maxiter, M=M)
+        if info != 0:
+            raise RuntimeError(f"Conjugate gradient solver did not converge: info={info}")
         return pressure
-    
+
     def apply_pressure_gradient(self, pressure):
-        """Apply pressure gradient correction to velocity field using numba parallelization"""
-        print("Applying pressure gradient correction...")
-        start_time = time.time()
-        
-        # Apply gradient correction in parallel
-        corrected_velocity = _apply_pressure_gradient_kernel(
-            self.velocity, 
-            pressure, 
-            self.weights_matrix, 
-            self.neighbors_mask,
-            self.valid_points,
-            self.n_points
-        )
-        
-        print(f"Pressure gradient correction applied in {time.time() - start_time:.2f} seconds")
-        
-        return corrected_velocity
-    
-    def apply_divergence_free_projection(self, max_iterations=10, tolerance=1e-4, pressure_solver_tol=1e-5):
-        """Apply divergence-free projection to the velocity field"""
-        print("Starting divergence-free projection...")
-        total_start_time = time.time()
-        
-        # Initialize
-        corrected_velocity = np.copy(self.velocity)
-        final_pressure = np.copy(self.pressure)
-        
-        # Calculate initial divergence
-        self.velocity = corrected_velocity
+        return apply_pressure_correction(self.n_points, self.velocity, pressure, self.point_neighbors, self.weights_matrix)
+
+    def update_vtk_grid(self, corrected_velocity, corrected_pressure):
+        pd = self.vtk_grid.GetPointData()
+        for name, arr in [(self.velocity_array_name, corrected_velocity), (self.pressure_array_name, corrected_pressure)]:
+            vtk_arr = numpy_support.numpy_to_vtk(arr, deep=1)
+            vtk_arr.SetName(name)
+            if pd.HasArray(name):
+                pd.RemoveArray(name)
+            pd.AddArray(vtk_arr)
+        return self.vtk_grid
+
+    def apply_divergence_free_projection(self, max_iterations=10, tolerance=1e-4):
+        print("Starting divergence-free projection loop...")
+        t_start = time.time()
+
+        corrected_velocity = self.velocity.copy()
+        divergence_history = []
+
         divergence = self.calculate_divergence()
-        initial_div_norm = np.linalg.norm(divergence)
-        current_div_norm = initial_div_norm
-        
-        print(f"Initial divergence norm: {initial_div_norm}")
-        
-        # Iterative projection
-        iteration = 0
-        
-        while current_div_norm > tolerance * initial_div_norm and iteration < max_iterations:
-            print(f"\nIteration {iteration+1}/{max_iterations}:")
-            
-            # Solve pressure Poisson equation
-            pressure = self.solve_pressure_poisson(divergence, tolerance=pressure_solver_tol)
-            
-            # Update pressure
-            final_pressure = pressure
-            
-            # Apply pressure gradient correction
-            self.velocity = corrected_velocity
-            corrected_velocity = self.apply_pressure_gradient(pressure)
-            
-            # Recalculate divergence
+        initial_norm = np.linalg.norm(divergence)
+        divergence_history.append(initial_norm)
+        print(f"Initial divergence norm: {initial_norm:.6e}")
+
+        for iteration in range(max_iterations):
+            print(f"Iteration {iteration + 1}")
+
+            pressure = self.solve_pressure_poisson(divergence)
+            corrected_velocity = apply_pressure_correction(
+                self.n_points, corrected_velocity, pressure, self.point_neighbors, self.offset, self.weights_matrix
+            )
+
             self.velocity = corrected_velocity
             divergence = self.calculate_divergence()
-            current_div_norm = np.linalg.norm(divergence)
-            
-            print(f"Divergence norm: {current_div_norm} ({current_div_norm/initial_div_norm:.4f} of initial)")
-            
-            iteration += 1
-            
-            if current_div_norm <= tolerance * initial_div_norm:
-                print(f"Converged after {iteration} iterations")
+            current_norm = np.linalg.norm(divergence)
+            divergence_history.append(current_norm)
+
+            print(f"Divergence norm: {current_norm:.6e}")
+
+            if current_norm <= tolerance * initial_norm:
+                print(f"Converged after {iteration + 1} iterations.")
                 break
-        
-        if iteration == max_iterations:
-            print(f"Warning: Did not converge to tolerance after {max_iterations} iterations")
-        
-        # Calculate divergence reduction
-        div_reduction = 100 * (1 - current_div_norm / initial_div_norm)
-        print(f"\nDivergence reduced by {div_reduction:.2f}%")
-        print(f"Final max absolute divergence: {np.max(np.abs(divergence))}")
-        print(f"Total projection time: {time.time() - total_start_time:.2f} seconds")
-        
-        return corrected_velocity, final_pressure, current_div_norm, iteration
+
+        print(f"Projection completed in {time.time() - t_start:.2f} seconds.")
+        self.plot_divergence_reduction(divergence_history)
+
+        return corrected_velocity, pressure, divergence_history[-1], iteration + 1
     
-    def update_vtk_grid(self, corrected_velocity, corrected_pressure):
-        """
-        Update the VTK grid with corrected velocity and pressure fields
-        
-        Parameters:
-        -----------
-        corrected_velocity : numpy.ndarray
-            Corrected velocity field
-        corrected_pressure : numpy.ndarray
-            Corrected pressure field
-            
-        Returns:
-        --------
-        vtkUnstructuredGrid
-            Updated VTK grid
-        """
-        print("Updating VTK grid...")
-        
-        # Convert velocity to VTK array
-        vtk_velocity = numpy_support.numpy_to_vtk(corrected_velocity, deep=1)
-        vtk_velocity.SetName(self.velocity_array_name)
-        
-        # Convert pressure to VTK array
-        vtk_pressure = numpy_support.numpy_to_vtk(corrected_pressure, deep=1)
-        vtk_pressure.SetName(self.pressure_array_name)
-        
-        # Update point data
-        point_data = self.vtk_grid.GetPointData()
-        
-        # Update or add velocity
-        if point_data.HasArray(self.velocity_array_name):
-            point_data.RemoveArray(self.velocity_array_name)
-        point_data.AddArray(vtk_velocity)
-        
-        # Update or add pressure
-        if point_data.HasArray(self.pressure_array_name):
-            point_data.RemoveArray(self.pressure_array_name)
-        point_data.AddArray(vtk_pressure)
-        
-        # Calculate divergence for visualization
-        divergence = self.calculate_divergence()
-        vtk_divergence = numpy_support.numpy_to_vtk(divergence, deep=1)
-        vtk_divergence.SetName("divergence")
-        
-        if point_data.HasArray("divergence"):
-            point_data.RemoveArray("divergence")
-        point_data.AddArray(vtk_divergence)
-        
-        print("VTK grid updated successfully")
-        return self.vtk_grid
+    def plot_divergence_reduction(self, divergence_history):
+        plt.figure(figsize=(10, 6))
+        plt.plot(divergence_history, marker='o')
+        plt.yscale('log')
+        plt.title("Divergence Reduction Over Iterations")
+        plt.xlabel("Iteration")
+        plt.ylabel("Divergence Norm (log scale)")
+        plt.grid()
+        plt.show()
