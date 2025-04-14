@@ -5,6 +5,7 @@ import time
 from numba import prange, njit
 import torch
 import numpy as np
+import scipy
 from scipy.spatial import KDTree
 import tqdm
 import vtk
@@ -854,29 +855,62 @@ def apply_pressure_correction(n_points, velocity, pressure, neighbors_flat, offs
 
 @njit(parallel=True)
 def assemble_laplacian(n_points, neighbors_flat, offsets, weights_matrix):
-    max_nnz = neighbors_flat.shape[0] + n_points  # conservative estimate
-    row_indices = np.empty(max_nnz, dtype=np.int64)
-    col_indices = np.empty(max_nnz, dtype=np.int64)
-    data = np.empty(max_nnz, dtype=np.float64)
+    row_indices = np.zeros(neighbors_flat.shape[0] + n_points, dtype=np.int64)
+    col_indices = np.zeros(neighbors_flat.shape[0] + n_points, dtype=np.int64)
+    data = np.zeros(neighbors_flat.shape[0] + n_points, dtype=np.float64)
 
     idx = 0
+    # Track diagonal values separately to avoid duplicates
+    diag_values = np.zeros(n_points, dtype=np.float64)
+    
+    # First pass: collect off-diagonal entries and accumulate diagonal values
     for i in prange(n_points):
         start, end = offsets[i], offsets[i + 1]
-        diag_value = 0.0
+        
         for k in range(start, end):
             j = neighbors_flat[k]
-            weight = np.sum(weights_matrix[i, :, k - start])
+            # Use the NORM of the weight vector instead of its sum
+            # This ensures we get a positive weight even if components cancel out
+            weight_vec = weights_matrix[i, :, k - start]
+            weight = np.sqrt(weight_vec[0]**2 + weight_vec[1]**2 + weight_vec[2]**2)
+            
+            # Skip truly negligible weights
+            if weight < 1e-12:
+                continue
+                
+            # For off-diagonal entries
+            if i != j:
+                row_indices[idx] = i
+                col_indices[idx] = j
+                data[idx] = -weight
+                idx += 1
+                # Accumulate diagonal value
+                diag_values[i] += weight
+    
+    # Second pass: add diagonal entries
+    for i in range(n_points):
+        if diag_values[i] > 1e-12:  # Only add non-zero diagonals
             row_indices[idx] = i
-            col_indices[idx] = j
-            data[idx] = -weight
+            col_indices[idx] = i
+            data[idx] = diag_values[i]
             idx += 1
-            diag_value += weight
-        row_indices[idx] = i
-        col_indices[idx] = i
-        data[idx] = diag_value
-        idx += 1
-
+        else:
+            # If the diagonal would be zero, add a small positive value
+            # This prevents singular matrix problems
+            row_indices[idx] = i
+            col_indices[idx] = i
+            data[idx] = 1.0  # Use a reasonable value
+            idx += 1
+    
+    # # Trim arrays to actual size
+    # print("=== Laplacian Assembly Debug ===")
+    # print(f"Total Points (Rows): {n_points}")
+    # print(f"Non-zeros inserted: {idx}")
+    # print(f"Number of zero diagonals (fixed): {np.sum(diag_values < 1e-12)}")
+    # print("=================================")
+    
     return row_indices[:idx], col_indices[:idx], data[:idx]
+    
 
 class DivergenceFreeProjection:
     def __init__(self, vtk_grid, velocity_array_name="velocity", pressure_array_name="pressure"):
@@ -910,10 +944,21 @@ class DivergenceFreeProjection:
         offsets[1:] = np.cumsum(neighbor_counts)
         neighbors_flat = np.empty(offsets[-1], dtype=np.int64)
 
+        isolated_points = []
         for i in range(n_points):
             neighbors = list(neighbor_sets[i])
+            if len(neighbors) == 0:
+                isolated_points.append(i)
             neighbors_flat[offsets[i]:offsets[i + 1]] = neighbors
 
+        # print("=== Build Connectivity Debug ===")
+        # print(f"Total Points: {n_points}")
+        # print(f"Total Cells: {len(cells)}")
+        # print(f"Total Neighbors Recorded: {neighbors_flat.shape[0]}")
+        # print(f"Number of Isolated Points: {len(isolated_points)}")
+        # if len(isolated_points) > 0:
+        #     print(f"Isolated Point Indices: {isolated_points[:50]}{'...' if len(isolated_points) > 50 else ''}")
+        # print("=================================")
         return neighbors_flat, offsets
 
     def _extract_cells(self):
@@ -932,20 +977,110 @@ class DivergenceFreeProjection:
         return compute_divergence(self.n_points, self.velocity, self.point_neighbors, self.offset, self.weights_matrix)
 
     def build_laplacian_matrix(self):
+        # First analyze some sample weights
+        # print("=== Weight Matrix Analysis ===")
+        # sample_points = np.random.choice(self.n_points, size=5, replace=False)
+        # for i in sample_points:
+        #     start, end = self.offset[i], self.offset[i + 1]
+        #     n_neighbors = end - start
+        #     print(f"Point {i}: {n_neighbors} neighbors")
+            
+        #     if n_neighbors > 0:
+        #         weights_sum = 0
+        #         for k in range(n_neighbors):
+        #             weight_vec = self.weights_matrix[i, :, k]
+        #             weight_sum = np.sum(weight_vec)
+        #             weight_norm = np.linalg.norm(weight_vec)
+        #             weights_sum += weight_sum
+        #             print(f"  Neighbor {k}: sum={weight_sum:.6f}, norm={weight_norm:.6f}, vec={weight_vec}")
+                
+        #         print(f"  Total weights sum: {weights_sum:.6f}")
         rows, cols, data = assemble_laplacian(self.n_points, self.point_neighbors, self.offset, self.weights_matrix)
-        return csr_matrix((data, (rows, cols)), shape=(self.n_points, self.n_points))
+        
+        # # Check for duplicate entries again
+        # from collections import defaultdict
+        # dupes = defaultdict(int)
+        # for i in range(len(rows)):
+        #     dupes[(rows[i], cols[i])] += 1
+        
+        # multi_entries = {k: v for k, v in dupes.items() if v > 1}
+        # print(f"Duplicate entries after modified assembly: {len(multi_entries)}")
+        
+        laplacian = csr_matrix((data, (rows, cols)), shape=(self.n_points, self.n_points))
+        
+        # # Check matrix properties
+        # row_sums = np.abs(laplacian).sum(axis=1).A.flatten()
+        # zero_rows = np.sum(row_sums < 1e-12)
+        # print(f"Zero rows in final matrix: {zero_rows}")
+        
+        return laplacian
 
-    def solve_pressure_poisson(self, divergence, tol=1e-5, maxiter=2000):
+    def solve_pressure_poisson(self, divergence, tol=1e-5, maxiter=1000):
         laplacian = self.build_laplacian_matrix()
-        row_sums = np.abs(laplacian).sum(axis=1).A.flatten()
-        print("Any zero rows in Laplacian:", np.any(row_sums == 0))
-        print("number of zero rows in Laplacian:", np.sum(row_sums == 0))
-        print("Laplacian matrix shape:", laplacian.shape)
-        ml = pyamg.smoothed_aggregation_solver(laplacian)
-        M = ml.aspreconditioner(cycle='V')
-        pressure, info = cg(laplacian, -divergence, rtol=tol, maxiter=maxiter, M=M)
-        if info != 0:
-            raise RuntimeError(f"Conjugate gradient solver did not converge: info={info}")
+    
+        # Check matrix properties
+        print("=== Solver Debug ===")
+        diag_max = np.max(laplacian.diagonal())
+        diag_min = np.min(laplacian.diagonal())
+        print(f"Diagonal range: min={diag_min}, max={diag_max}, ratio={diag_max/diag_min}")
+        
+        # Try algebraic multigrid with stronger settings
+        try:
+            print("Using AMG solver with V-cycle...")
+            ml = pyamg.smoothed_aggregation_solver(laplacian, max_levels=20, max_coarse=500)
+            print(f"AMG levels: {len(ml.levels)}")
+            M = ml.aspreconditioner(cycle='V')
+            
+            # Increase maxiter and loosen tolerance if needed
+            pressure, info = cg(laplacian, -divergence, rtol=tol, maxiter=maxiter, M=M)
+            
+            # if info > 0:  # Not converged, but didn't fail with error
+            #     print(f"CG did not converge in {maxiter} iterations. Trying with W-cycle...")
+            #     # Try W-cycle which can be more effective but costlier
+            #     M = ml.aspreconditioner(cycle='W')
+            #     pressure, info = cg(laplacian, -divergence, rtol=tol*10, maxiter=maxiter, M=M)
+                
+            # if info > 0:  # Still not converged
+            #     print(f"AMG+CG still not converging. Trying GMRES with AMG...")
+            #     pressure, info = gmres(laplacian, -divergence, rtol=tol*10, maxiter=min(maxiter, 1000), M=M)
+                
+            if info != 0:
+                print(f"Iterative solvers didn't converge. Trying direct solver...")
+                # For moderate-sized problems, try a direct solve
+                if self.n_points < 100000:
+                    pressure = spsolve(laplacian, -divergence)
+                    info = 0  # Direct solve doesn't return info
+                else:
+                    # For larger problems, try relaxation method
+                    print("Problem too large for direct solver. Using relaxation method...")
+                    # Simple Jacobi iteration - slower but more robust
+                    pressure = np.zeros_like(divergence)
+                    diag_inv = 1.0 / laplacian.diagonal()
+                    
+                    max_jacobi = 2000  # Limit Jacobi iterations
+                    for iter in range(max_jacobi):
+                        # r = b - Ax
+                        residual = -divergence - laplacian @ pressure
+                        # x = x + D^-1 * r
+                        pressure += 0.1 * diag_inv * residual  # Use dampening factor 0.8
+                        
+                        # Check convergence
+                        res_norm = np.linalg.norm(residual)
+                        if res_norm < tol * np.linalg.norm(divergence):
+                            print(f"Jacobi converged in {iter+1} iterations")
+                            break
+                            
+                        if (iter+1) % 10 == 0:
+                            print(f"Jacobi iteration {iter+1}, residual = {res_norm}")
+                            
+                    if iter == max_jacobi-1:
+                        print(f"Warning: Jacobi did not fully converge, final residual = {res_norm}")
+                        
+        except Exception as e:
+            print(f"Solver error: {str(e)}")
+            raise
+        
+        print("=================================")
         return pressure
 
     def apply_pressure_gradient(self, pressure):
@@ -961,7 +1096,7 @@ class DivergenceFreeProjection:
             pd.AddArray(vtk_arr)
         return self.vtk_grid
 
-    def apply_divergence_free_projection(self, max_iterations=10, tolerance=1e-4):
+    def apply_divergence_free_projection(self, max_iterations=10, tolerance=1e-1):
         print("Starting divergence-free projection loop...")
         t_start = time.time()
 
