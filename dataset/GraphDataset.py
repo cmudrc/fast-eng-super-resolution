@@ -702,7 +702,7 @@ class DuctAnalysisDataset(GenericGraphDataset):
         reconstructed_mesh = append_filter.GetOutput()
 
         # smooth the velocity field
-        reconstructed_mesh = self.smooth_vtu_with_continuity(reconstructed_mesh)
+        # reconstructed_mesh = self.smooth_vtu_with_continuity(reconstructed_mesh)
 
         return reconstructed_mesh
     
@@ -787,37 +787,86 @@ class ProgressObserver:
 
 @njit(parallel=True)
 def compute_weights(n_points, points, neighbors_flat, offsets):
-    max_neighbors = np.max(offsets[1:] - offsets[:-1])
+    max_neighbors = 0
+    for i in range(n_points):
+        max_neighbors = max(max_neighbors, offsets[i+1] - offsets[i])
+    
     weights_matrix = np.zeros((n_points, 3, max_neighbors))
-
+    
     for i in prange(n_points):
         start, end = offsets[i], offsets[i + 1]
         n_neighbors = end - start
+        
         if n_neighbors == 0:
             continue
-
+            
+        if n_neighbors == 1:
+            # For single neighbor, use unit direction
+            j = neighbors_flat[start]
+            v = points[j] - points[i]
+            norm = np.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2])
+            if norm > 1e-10:
+                weights_matrix[i, :, 0] = v / norm
+            continue
+            
+        # Construct coordinate differences matrix
         A = np.zeros((n_neighbors, 3))
         for idx in range(n_neighbors):
             j = neighbors_flat[start + idx]
-            A[idx, :] = points[j, :] - points[i, :]
-
-        # Check if A is full rank
+            v = points[j] - points[i]
+            norm = np.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2])
+            if norm > 1e-10:
+                A[idx, :] = v / norm  # Normalize vectors
+        
+        # If we have enough neighbors, try to create a proper basis
         if n_neighbors >= 3:
-            U, S, Vh = np.linalg.svd(A, full_matrices=False)
-            cond_number = S[0] / S[-1] if S[-1] > 1e-12 else 1e16
-
-            if cond_number < 1e12:
-                S_inv = np.where(S > 1e-10, 1.0 / S, 0.0)
-                pinv = (Vh.T * S_inv) @ U.T
+            # SVD approach for more stability
+            try:
+                U, S, Vh = np.linalg.svd(A, full_matrices=False)
+                
+                # Check condition number and handle ill-conditioning
+                max_S = S[0]
+                min_S = S[-1] if S[-1] > 0 else S[-2] if len(S) > 1 and S[-2] > 0 else 1e-10
+                cond_number = max_S / min_S
+                
+                if cond_number < 1e8:  # Reasonable condition number
+                    # Use truncated SVD with threshold
+                    S_inv = np.zeros_like(S)
+                    threshold = max_S * 1e-6
+                    for s_idx in range(len(S)):
+                        if S[s_idx] > threshold:
+                            S_inv[s_idx] = 1.0 / S[s_idx]
+                    
+                    # Compute pseudoinverse
+                    pinv = Vh.T @ np.diag(S_inv) @ U.T
+                    
+                    # Extract weights
+                    for idx in range(n_neighbors):
+                        weights_matrix[i, :, idx] = pinv[:, idx]
+                        
+                    # Check if weights are too large (indication of instability)
+                    w_norm = 0.0
+                    for idx in range(n_neighbors):
+                        for d in range(3):
+                            w_norm += weights_matrix[i, d, idx]**2
+                    
+                    # If weights are too large, revert to simpler method
+                    if w_norm > 100.0:
+                        for idx in range(n_neighbors):
+                            weights_matrix[i, :, idx] = 1.0 / n_neighbors * A[idx, :]
+                else:
+                    # Fall back to simple averaging for ill-conditioned systems
+                    for idx in range(n_neighbors):
+                        weights_matrix[i, :, idx] = 1.0 / n_neighbors * A[idx, :]
+            except:
+                # Any numerical errors, fall back to simple weights
                 for idx in range(n_neighbors):
-                    weights_matrix[i, :, idx] = pinv[:, idx]
-            else:
-                weights_matrix[i, :, :n_neighbors] = 1.0 / n_neighbors
-
+                    weights_matrix[i, :, idx] = 1.0 / n_neighbors * A[idx, :]
         else:
-            # Under-determined system
-            weights_matrix[i, :, :n_neighbors] = 1.0 / n_neighbors
-
+            # For 1 or 2 neighbors, use normalized vectors directly
+            for idx in range(n_neighbors):
+                weights_matrix[i, :, idx] = 1.0 / n_neighbors * A[idx, :]
+    
     return weights_matrix
 
 
@@ -837,6 +886,59 @@ def compute_divergence(n_points, velocity, neighbors_flat, offsets, weights_matr
         divergence[i] = np.sum(weights_matrix[i, :, :n_neighbors] @ vel_diffs)
     return divergence
 
+# @njit(parallel=True)
+def solve_pressure_poisson_adaptive(laplacian_matrix, divergence, max_iterations=1000, initial_omega=0.05):
+    n = divergence.shape[0]
+    pressure = np.zeros(n, dtype=np.float64)
+    residual = -divergence.copy()  # Initial residual
+    
+    # Extract diagonal and off-diagonal parts
+    diag = np.zeros(n)
+    for i in range(n):
+        diag[i] = laplacian_matrix[i, i]
+    
+    # Normalize divergence for better convergence check
+    div_norm = np.linalg.norm(divergence)
+    if div_norm < 1e-5:
+        return pressure  # No divergence to correct
+    
+    # Adaptive relaxation
+    omega = initial_omega
+    prev_res_norm = np.linalg.norm(residual)
+    
+    for iter in range(max_iterations):
+        # Compute new pressure based on current residual
+        delta_p = np.zeros(n)
+        for i in prange(n):
+            if diag[i] > 1e-10:
+                delta_p[i] = omega * residual[i] / diag[i]
+        
+        # Update pressure
+        pressure += delta_p
+        
+        # Recompute residual: r = b - Ax
+        residual = -divergence - laplacian_matrix @ pressure
+        
+        # Check convergence
+        res_norm = np.linalg.norm(residual)
+        
+        # Adaptive omega adjustment
+        if iter > 0 and iter % 10 == 0:
+            if res_norm < prev_res_norm:
+                # Converging, slightly increase omega
+                omega = min(omega * 1.05, 0.9)
+            else:
+                # Diverging, decrease omega
+                omega = max(omega * 0.5, 0.001)
+        
+        prev_res_norm = res_norm
+        print(f"Iteration {iter}: Residual Norm = {res_norm}, Omega = {omega}")
+        
+        # Convergence check
+        if res_norm < 1e-4 * div_norm:
+            break
+    
+    return pressure
 
 @njit(parallel=True)
 def apply_pressure_correction(n_points, velocity, pressure, neighbors_flat, offsets, weights_matrix):
@@ -855,60 +957,71 @@ def apply_pressure_correction(n_points, velocity, pressure, neighbors_flat, offs
 
 @njit(parallel=True)
 def assemble_laplacian(n_points, neighbors_flat, offsets, weights_matrix):
-    row_indices = np.zeros(neighbors_flat.shape[0] + n_points, dtype=np.int64)
-    col_indices = np.zeros(neighbors_flat.shape[0] + n_points, dtype=np.int64)
-    data = np.zeros(neighbors_flat.shape[0] + n_points, dtype=np.float64)
-
-    idx = 0
-    # Track diagonal values separately to avoid duplicates
-    diag_values = np.zeros(n_points, dtype=np.float64)
+    # Estimate number of non-zero entries (diagonal + off-diagonal)
+    nnz_estimate = n_points + neighbors_flat.shape[0]
+    row_indices = np.zeros(nnz_estimate, dtype=np.int64)
+    col_indices = np.zeros(nnz_estimate, dtype=np.int64)
+    data = np.zeros(nnz_estimate, dtype=np.float64)
     
-    # First pass: collect off-diagonal entries and accumulate diagonal values
+    idx = 0
+    
+    # Process each point
     for i in prange(n_points):
         start, end = offsets[i], offsets[i + 1]
+        n_neighbors = end - start
         
-        for k in range(start, end):
-            j = neighbors_flat[k]
-            # Use the NORM of the weight vector instead of its sum
-            # This ensures we get a positive weight even if components cancel out
-            weight_vec = weights_matrix[i, :, k - start]
-            weight = np.sqrt(weight_vec[0]**2 + weight_vec[1]**2 + weight_vec[2]**2)
-            
-            # Skip truly negligible weights
-            if weight < 1e-12:
-                continue
-                
-            # For off-diagonal entries
-            if i != j:
+        if n_neighbors == 0:  # Isolated point
+            row_indices[idx] = i
+            col_indices[idx] = i
+            data[idx] = 1.0  # Identity for isolated points
+            idx += 1
+            continue
+        
+        # Sum for normalization
+        total_weight = 0.0
+        weights = np.zeros(n_neighbors, dtype=np.float64)
+        
+        # First pass: compute weights and their sum
+        for k in range(n_neighbors):
+            j = neighbors_flat[start + k]
+            weight_vec = weights_matrix[i, :, k]
+            # Use norm of weight vector (more stable than simply summing components)
+            weight = np.sqrt(np.sum(weight_vec**2))
+            weights[k] = weight
+            total_weight += weight
+        
+        # Skip if total weight is too small
+        if total_weight < 1e-10:
+            row_indices[idx] = i
+            col_indices[idx] = i
+            data[idx] = 1.0  # Identity for degenerate cases
+            idx += 1
+            continue
+        
+        # Normalize weights to improve conditioning
+        scale_factor = 1.0
+        if total_weight > 0:
+            scale_factor = 1.0 / total_weight
+        
+        # Second pass: add off-diagonal entries (negative weights)
+        diag_sum = 0.0
+        for k in range(n_neighbors):
+            j = neighbors_flat[start + k]
+            if i != j:  # Off-diagonal
+                weight = weights[k] * scale_factor
                 row_indices[idx] = i
                 col_indices[idx] = j
-                data[idx] = -weight
+                data[idx] = -weight  # Negative for off-diagonal
                 idx += 1
-                # Accumulate diagonal value
-                diag_values[i] += weight
+                diag_sum += weight
+        
+        # Add diagonal entry (sum of off-diagonal weights)
+        row_indices[idx] = i
+        col_indices[idx] = i
+        data[idx] = diag_sum  # Diagonal is sum of off-diagonal
+        idx += 1
     
-    # Second pass: add diagonal entries
-    for i in range(n_points):
-        if diag_values[i] > 1e-12:  # Only add non-zero diagonals
-            row_indices[idx] = i
-            col_indices[idx] = i
-            data[idx] = diag_values[i]
-            idx += 1
-        else:
-            # If the diagonal would be zero, add a small positive value
-            # This prevents singular matrix problems
-            row_indices[idx] = i
-            col_indices[idx] = i
-            data[idx] = 1.0  # Use a reasonable value
-            idx += 1
-    
-    # # Trim arrays to actual size
-    # print("=== Laplacian Assembly Debug ===")
-    # print(f"Total Points (Rows): {n_points}")
-    # print(f"Non-zeros inserted: {idx}")
-    # print(f"Number of zero diagonals (fixed): {np.sum(diag_values < 1e-12)}")
-    # print("=================================")
-    
+    # Trim arrays to actual size used
     return row_indices[:idx], col_indices[:idx], data[:idx]
     
 
@@ -1027,9 +1140,17 @@ class DivergenceFreeProjection:
         # Try algebraic multigrid with stronger settings
         try:
             print("Using AMG solver with V-cycle...")
-            ml = pyamg.smoothed_aggregation_solver(laplacian, max_levels=20, max_coarse=500)
+            ml = pyamg.smoothed_aggregation_solver(
+                laplacian, 
+                max_levels=40,  # Allow more levels
+                max_coarse=50,  # Smaller coarse problem
+                strength=('evolution', {'epsilon': 4.0}),  # More aggressive coarsening
+                smooth=('energy', {'weighting': 'local'}),  # Better smoother
+                presmoother=('gauss_seidel', {'sweep': 'symmetric', 'iterations': 2}),
+                postsmoother=('gauss_seidel', {'sweep': 'symmetric', 'iterations': 2})
+            )
             print(f"AMG levels: {len(ml.levels)}")
-            M = ml.aspreconditioner(cycle='V')
+            M = ml.aspreconditioner(cycle='W')
             
             # Increase maxiter and loosen tolerance if needed
             pressure, info = cg(laplacian, -divergence, rtol=tol, maxiter=maxiter, M=M)
@@ -1053,28 +1174,7 @@ class DivergenceFreeProjection:
                 else:
                     # For larger problems, try relaxation method
                     print("Problem too large for direct solver. Using relaxation method...")
-                    # Simple Jacobi iteration - slower but more robust
-                    pressure = np.zeros_like(divergence)
-                    diag_inv = 1.0 / laplacian.diagonal()
-                    
-                    max_jacobi = 2000  # Limit Jacobi iterations
-                    for iter in range(max_jacobi):
-                        # r = b - Ax
-                        residual = -divergence - laplacian @ pressure
-                        # x = x + D^-1 * r
-                        pressure += 0.1 * diag_inv * residual  # Use dampening factor 0.8
-                        
-                        # Check convergence
-                        res_norm = np.linalg.norm(residual)
-                        if res_norm < tol * np.linalg.norm(divergence):
-                            print(f"Jacobi converged in {iter+1} iterations")
-                            break
-                            
-                        if (iter+1) % 10 == 0:
-                            print(f"Jacobi iteration {iter+1}, residual = {res_norm}")
-                            
-                    if iter == max_jacobi-1:
-                        print(f"Warning: Jacobi did not fully converge, final residual = {res_norm}")
+                    pressure = solve_pressure_poisson_adaptive(laplacian, -divergence)
                         
         except Exception as e:
             print(f"Solver error: {str(e)}")
@@ -1097,40 +1197,128 @@ class DivergenceFreeProjection:
         return self.vtk_grid
 
     def apply_divergence_free_projection(self, max_iterations=10, tolerance=1e-1):
-        print("Starting divergence-free projection loop...")
+        """
+        Apply divergence-free projection with stability controls and fallback strategies.
+        """
+        print("Starting divergence-free projection with stability controls...")
         t_start = time.time()
-
-        corrected_velocity = self.velocity.copy()
-        divergence_history = []
-
+        
+        # Original velocity
+        original_velocity = self.velocity.copy()
+        current_velocity = original_velocity.copy()
+        best_velocity = original_velocity.copy()
+        best_pressure = np.zeros(self.n_points)
+        
+        # Compute initial divergence
         divergence = self.calculate_divergence()
         initial_norm = np.linalg.norm(divergence)
-        divergence_history.append(initial_norm)
+        best_div_norm = initial_norm
+        divergence_history = [initial_norm]
+        
         print(f"Initial divergence norm: {initial_norm:.6e}")
-
+        
+        # For really small divergence, skip the process
+        if initial_norm < tolerance:
+            print(f"Initial divergence {initial_norm:.6e} already below tolerance {tolerance:.6e}")
+            return original_velocity, np.zeros(self.n_points), initial_norm, 0
+        
+        # Relaxation factor for incremental projection
+        alpha = 0.2  # Start with conservative value
+        
         for iteration in range(max_iterations):
             print(f"Iteration {iteration + 1}")
-
-            pressure = self.solve_pressure_poisson(divergence)
-            corrected_velocity = apply_pressure_correction(
-                self.n_points, corrected_velocity, pressure, self.point_neighbors, self.offset, self.weights_matrix
+            
+            # Solve pressure Poisson equation
+            pressure = self.solve_pressure_poisson(divergence, tol=1e-5*initial_norm)
+            
+            # Check pressure solution
+            pressure_norm = np.linalg.norm(pressure)
+            if pressure_norm > 1e3 * initial_norm:
+                print(f"Warning: Pressure solution appears unstable (norm={pressure_norm:.6e})")
+                # Cap the pressure values
+                scale = 1e3 * initial_norm / pressure_norm
+                pressure *= scale
+                print(f"Scaling pressure by {scale:.6e}")
+            
+            # Apply pressure correction with relaxation
+            next_velocity = apply_pressure_correction(
+                current_velocity, pressure, 
+                self.point_neighbors, self.offset, self.weights_matrix,
+                alpha=alpha  # Use relaxation factor
             )
-
-            self.velocity = corrected_velocity
+            
+            # Store previous velocity for possible rollback
+            prev_velocity = current_velocity.copy()
+            current_velocity = next_velocity
+            
+            # Update velocity and recompute divergence
+            self.velocity = current_velocity
             divergence = self.calculate_divergence()
             current_norm = np.linalg.norm(divergence)
             divergence_history.append(current_norm)
-
-            print(f"Divergence norm: {current_norm:.6e}")
-
+            
+            print(f"Divergence norm: {current_norm:.6e} (relative: {current_norm/initial_norm:.6e})")
+            
+            # Check if we improved
+            if current_norm < best_div_norm:
+                best_div_norm = current_norm
+                best_velocity = current_velocity.copy()
+                best_pressure = pressure.copy()
+                
+                # If we're making good progress, increase alpha slightly
+                if current_norm < 0.7 * divergence_history[-2]:
+                    alpha = min(alpha * 1.2, 0.5)
+                    print(f"Good progress, increasing alpha to {alpha:.4f}")
+                    
+            else:
+                # We got worse - roll back and decrease alpha
+                current_velocity = prev_velocity.copy()
+                self.velocity = current_velocity
+                
+                # Recompute divergence to ensure it's consistent
+                divergence = self.calculate_divergence()
+                current_norm = np.linalg.norm(divergence)
+                
+                # Replace last history entry
+                divergence_history[-1] = current_norm
+                
+                # Decrease alpha
+                alpha = max(alpha * 0.5, 0.05)
+                print(f"Projection diverged, rolling back. New alpha: {alpha:.4f}")
+                
+                # If we've decreased alpha multiple times with no improvement, break
+                if alpha < 0.06 and iteration > 2:
+                    print("Alpha below threshold with no improvement. Stopping early.")
+                    break
+            
+            # Check for early convergence
             if current_norm <= tolerance * initial_norm:
                 print(f"Converged after {iteration + 1} iterations.")
                 break
-
+        
+        # Always use best result
+        self.velocity = best_velocity
+        final_div_norm = np.linalg.norm(self.calculate_divergence())
+        
+        print(f"Using best projection result with divergence norm: {final_div_norm:.6e}")
         print(f"Projection completed in {time.time() - t_start:.2f} seconds.")
-        self.plot_divergence_reduction(divergence_history)
+        print(f"Relative improvement: {initial_norm/final_div_norm:.2f}x")
+        
+        # If we didn't improve at all, warn the user
+        if final_div_norm >= initial_norm:
+            print(f"WARNING: Projection failed to reduce divergence. Original: {initial_norm:.6e}, Final: {final_div_norm:.6e}")
+            # As a last resort, use a very small correction
+            self.velocity = original_velocity * 0.98 + best_velocity * 0.02
+            final_div_norm = np.linalg.norm(self.calculate_divergence())
+            
+            if final_div_norm >= initial_norm:
+                # If even that didn't work, revert completely
+                self.velocity = original_velocity
+                final_div_norm = initial_norm
+                print("Completely reverting to original velocity field.")
+            
+        return self.velocity, best_pressure, final_div_norm, max_iterations
 
-        return corrected_velocity, pressure, divergence_history[-1], iteration + 1
     
     def plot_divergence_reduction(self, divergence_history):
         plt.figure(figsize=(10, 6))
