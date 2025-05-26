@@ -278,15 +278,14 @@ class GNNPartitionScheduler():
         if rank == 0:
             wandb.init(project='domain_partition_scheduler', group='partition_training', config=train_config)
 
-        # Iterate through subsets
-        # for i, subset in enumerate(subsets):
-        # # Split dataset
-        # train_dataset, val_dataset = random_split(
-        #     subset, 
-        #     [int(0.8 * len(subset)), len(subset) - int(0.8 * len(subset))]
-        # )
-        # split train dataset based on rank
-        # train_dataset_actual = train_dataset[rank::world_size]
+        # split dataset according to the rank
+        train_idx = np.arange(len(train_dataset))
+        val_idx = np.arange(len(val_dataset))
+        num_train_samples = len(train_dataset) // world_size
+        num_val_samples = len(val_dataset) // world_size
+        train_dataset = torch.utils.data.Subset(train_dataset, train_idx[rank*num_train_samples:(rank+1)*num_train_samples])
+        val_dataset = torch.utils.data.Subset(val_dataset, val_idx[rank*num_val_samples:(rank+1)*num_val_samples])
+
         train_loader = DataLoader(
             train_dataset, batch_size=train_config['batch_size'], shuffle=True, num_workers=2
         )
@@ -364,7 +363,7 @@ class GNNPartitionScheduler():
                     # Reduce the loss across all processes
                     # if epoch == 0:
                     #     continue
-                    
+                    torch.cuda.synchronize()
                     dist.all_reduce(torch.tensor(train_loss, device=local_device), op=dist.ReduceOp.AVG)
                     dist.all_reduce(torch.tensor(val_loss, device=local_device), op=dist.ReduceOp.AVG)
                     scheduler.step()
