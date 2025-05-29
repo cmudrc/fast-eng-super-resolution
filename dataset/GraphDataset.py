@@ -1,5 +1,6 @@
 import os
 import psutil
+import gc
 # os.environ['HDF5_DISABLE_VERSION_CHECK'] = '2' # Only add this for TRACE to work, comment out for other cases! 
 import time
 
@@ -11,7 +12,7 @@ from scipy.spatial import KDTree
 import tqdm
 import vtk
 from vtk import vtkFLUENTReader, vtkFLUENTCFFReader
-from vtkmodules.util import numpy_support  
+from vtkmodules.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 from vtkmodules.numpy_interface import dataset_adapter as dsa
 import pyvista as pv
 # import pyamg
@@ -788,8 +789,9 @@ class AnsysDataset(GenericGraphDataset):
                 pos = torch.tensor(np.array(group['pos']), dtype=torch.float)
                 edge_index = torch.tensor(np.array(group['edge_index']), dtype=torch.long)
                 edge_attr = torch.tensor(np.array(group['edge_attr']), dtype=torch.float)
+                global_node_ids = torch.tensor(np.array(group['global_node_ids']), dtype=torch.long)
 
-                data = Data(x=x, y=y, pos=pos, edge_index=edge_index, edge_attr=edge_attr)
+                data = Data(x=x, y=y, pos=pos, edge_index=edge_index, edge_attr=edge_attr, global_node_ids=global_node_ids)
                 return data
 
     @property
@@ -859,14 +861,23 @@ class AnsysDataset(GenericGraphDataset):
                     edge_set.add(edge)
 
         edge_index = torch.tensor(list(edge_set), dtype=torch.long).t()
+        edge_attr = np.linalg.norm(pos[edge_index[0]] - pos[edge_index[1]], axis=1)
+        edge_attr = torch.tensor(edge_attr, dtype=torch.float).unsqueeze(1)
 
-        return Data(pos=pos, edge_index=edge_index)
+        return Data(pos=pos, edge_index=edge_index, edge_attr=edge_attr)
 
     def _map_physics_data_to_mesh(self, mesh, physics_points):
         """
         Map the physics data to the mesh nodes based on the coordinates using parallel processing.
         """
         num_points = mesh.GetNumberOfPoints()
+        # check mesh points and physics points have the same number of points
+        if num_points == 0:
+            raise ValueError("Mesh has no points to map physics data.")
+        if len(physics_points) == 0:
+            raise ValueError("Physics points are empty. Cannot map to mesh.")
+        if physics_points.shape[0] != num_points:
+            raise ValueError(f"Mismatch: physics points length {len(physics_points)} must match the number of points in the mesh {num_points}.")
         mesh_points = np.array([mesh.GetPoint(i) for i in range(num_points)])  # Convert mesh points to NumPy array
         
         tree = KDTree(physics_points)  # Build KDTree for fast lookup
@@ -946,6 +957,7 @@ class AnsysDataset(GenericGraphDataset):
 
                 pressure = torch.tensor(physics['absolute-pressure'], dtype=torch.float).unsqueeze(1)
                 # normalize the pressure
+                pressure = pressure - torch.min(pressure)
                 pressure = pressure / torch.max(pressure)
 
                 physics_map = self._map_physics_data_to_mesh(mesh, physics_points)
@@ -967,6 +979,21 @@ class AnsysDataset(GenericGraphDataset):
                     data.y = torch.cat([velocity, pressure], dim=1)
                     data.wall_idx = wall_index_tensor
                     data_list.append(data)
+
+                    # save physics data into vtk for visualization
+                    velocity_array = vtk.vtkFloatArray()
+                    pressure_array = vtk.vtkFloatArray()
+                    velocity_array.SetName("velocity")
+                    pressure_array.SetName("pressure")
+                    velocity_array.SetNumberOfComponents(3)
+                    pressure_array.SetNumberOfComponents(1)
+                    for row in velocity.numpy():
+                        velocity_array.InsertNextTuple3(row[0], row[1], row[2])
+                    for value in pressure.numpy():
+                        pressure_array.InsertNextTuple1(value)
+                    mesh_high.GetPointData().AddArray(velocity_array)
+                    mesh_high.GetPointData().AddArray(pressure_array)
+
                 else:
                     # call lagrangian interpolation to interpolate the physics data to the high resolution mesh
                     velocity_x_high = self._lagrangian_interpolation(mesh, velocity_x, mesh_high)
@@ -978,12 +1005,34 @@ class AnsysDataset(GenericGraphDataset):
                     # normalize the velocity
                     velocity_high = velocity_high / torch.max(torch.abs(velocity_high))
                     # normalize the pressure
+                    pressure_high = pressure_high - torch.min(pressure_high)
                     pressure_high = pressure_high / torch.max(pressure_high)
                     # check if nan exists in the interpolated physics data
                     if torch.isnan(velocity_high).sum() > 0 or torch.isnan(pressure_high).sum() > 0:
                         print('nan exists in interpolated physics data')
 
+                    # update the physics data in the high resolution mesh
+                    interpolated_velocity_array = vtk.vtkFloatArray()
+                    interpolated_pressure_array = vtk.vtkFloatArray()
+                    interpolated_velocity_array.SetName("interpolated_velocity")
+                    interpolated_pressure_array.SetName("interpolated_pressure")
+                    interpolated_velocity_array.SetNumberOfComponents(3)
+                    interpolated_pressure_array.SetNumberOfComponents(1)
+                    for row in velocity_high.numpy():
+                        interpolated_velocity_array.InsertNextTuple3(row[0], row[1], row[2])
+                    for value in pressure_high.numpy():
+                        interpolated_pressure_array.InsertNextTuple1(value)
+                    mesh_high.GetPointData().AddArray(interpolated_velocity_array)
+                    mesh_high.GetPointData().AddArray(interpolated_pressure_array)
+
                     data_list[idx].x = torch.cat([velocity_high, pressure_high], dim=1)
+
+            # save the high resolution mesh with physics data
+            writer = vtk.vtkXMLUnstructuredGridWriter()
+            writer.SetFileName(os.path.join(self.processed_dir, f'mesh_{idx}_high.vtu'))
+            writer.SetInputData(mesh_high)
+            writer.Write()
+            print(f"Processed mesh {idx} with {num_points} points and {num_cells} cells.")
 
         return data_list
     
@@ -1024,8 +1073,20 @@ class AnsysDataset(GenericGraphDataset):
 
         mesh.GetPointData().AddArray(physics_array)
 
-        # Step 2: Use vtkProbeFilter for interpolation
-        probe_filter = vtk.vtkProbeFilter()
+        mesh_spacing = 0.02  # Adjust based on your mesh scale
+        # cellLocator = vtk.vtkPointLocator()
+        # cellLocator.SetDataSet(mesh)
+        # cellLocator.SetTolerance(1)  # Adjust based on your mesh scale
+        # cellLocator.BuildLocator()
+
+        # Use a Gaussian kernel with larger radius
+        kernel = vtk.vtkGaussianKernel()
+        kernel.SetRadius(mesh_spacing * 3)  # Adjust multiplier as needed
+        kernel.SetSharpness(2)
+
+        probe_filter = vtk.vtkPointInterpolator()
+        probe_filter.SetKernel(kernel)
+        # probe_filter.SetLocator(cellLocator)
         probe_filter.SetSourceData(mesh)  # Set original mesh as the source
         probe_filter.SetInputData(new_mesh)  # Set new mesh as the target for interpolation
         probe_filter.Update()
@@ -1052,15 +1113,14 @@ class AnsysDataset(GenericGraphDataset):
         else:
             os.makedirs(os.path.join(self.root, 'partition'), exist_ok=True)
             for i in range(len(self.raw_file_names)):
-                reader = vtkFLUENTCFFReader()
-                high_res_mesh_path = self.raw_file_names[i] + '_high.cas.h5'
-                reader.SetFileName(os.path.join(self.raw_dir, high_res_mesh_path))
+                reader = vtk.vtkXMLUnstructuredGridReader()
+                high_res_mesh_path = 'mesh_{}_high.vtu'.format(i)
+                reader.SetFileName(os.path.join(self.processed_dir, high_res_mesh_path))
                 reader.Update()
-                mesh = self.extract_unstructured_grid(reader.GetOutput())
-                cur_data = data[i]
-                x, y, pos = cur_data.x, cur_data.y, cur_data.pos
+                mesh = reader.GetOutput()
+                # check number of points in the mesh matches the number of points in the data
                 num_subdomains = self.sub_size
-                self._get_partition_domain(mesh, i, x, y, pos, num_subdomains)
+                self._get_partition_domain(mesh, i, num_subdomains)
 
             # concatenate all subdomains from saved separate h5 files into one h5 file
             with h5py.File(os.path.join(self.root, 'partition', 'data.h5'), 'w') as f:
@@ -1118,7 +1178,7 @@ class AnsysDataset(GenericGraphDataset):
         render_window.Render()
         interactor.Start()
     
-    def _get_partition_domain(self, mesh, i, x, y, pos, num_subdomains):
+    def _get_partition_domain(self, mesh, i, num_subdomains):
         """
         Perform domain decomposition on a VTK unstructured mesh and associated physics data.
         Uses METIS-based partitioning without explicit graph conversion.
@@ -1154,7 +1214,7 @@ class AnsysDataset(GenericGraphDataset):
         # progress_observer = vtk.vtkProgressObserver()
         distributed_filter.AddObserver("ProgressEvent", ProgressObserver())
 
-        distributed_filter.SetBoundaryModeToAssignToOneRegion()
+        distributed_filter.SetBoundaryModeToAssignToAllIntersectingRegions()
 
         # Ensure the input data is correctly assigned
         distributed_filter.SetInputData(mesh)
@@ -1173,9 +1233,6 @@ class AnsysDataset(GenericGraphDataset):
         writer.SetInputData(partitioned_mesh)
         writer.Write()
 
-        # Visualize the partitioned mesh
-        # self.visualize_partitioned_dataset(partitioned_mesh)
-
         controller.Finalize()
 
         num_partitions = partitioned_mesh.GetNumberOfPartitions()
@@ -1192,25 +1249,37 @@ class AnsysDataset(GenericGraphDataset):
                     continue
 
                 node_id_array = partition.GetPointData().GetArray("GlobalPointIds")
+                velocity_array = partition.GetPointData().GetArray("velocity")
+                pressure_array = partition.GetPointData().GetArray("pressure")
+                input_velocity_array = partition.GetPointData().GetArray("interpolated_velocity")
+                input_pressure_array = partition.GetPointData().GetArray("interpolated_pressure")
+                if velocity_array is None or pressure_array is None or input_velocity_array is None or input_pressure_array is None:
+                    print(f"Error: Partition {i} missing velocity or pressure data. Skipping.")
+                    continue
                 if node_id_array is None:
                     print(f"Error: Partition {i} missing GlobalNodeID. Skipping.")
                     continue
 
-                global_node_ids = np.array([node_id_array.GetValue(j) for j in range(node_id_array.GetNumberOfValues())])
-                sub_x = x[global_node_ids]
-                sub_y = y[global_node_ids]
-                sub_pos = pos[global_node_ids]
+                global_node_ids = vtk_to_numpy(node_id_array)
+                velocity = vtk_to_numpy(velocity_array)
+                pressure = vtk_to_numpy(pressure_array)
+                input_velocity_array = vtk_to_numpy(input_velocity_array)
+                input_pressure_array = vtk_to_numpy(input_pressure_array)
+                # cat velocity and pressure as input and label data
+                sub_x = torch.cat([torch.tensor(input_velocity_array, dtype=torch.float), 
+                                   torch.tensor(input_pressure_array, dtype=torch.float).unsqueeze(1)], dim=1)
+                sub_y = torch.cat([torch.tensor(velocity, dtype=torch.float),
+                                   torch.tensor(pressure, dtype=torch.float).unsqueeze(1)], dim=1)
 
                 subdomain_data = self.vtk_to_pyg(partition)
-                # set edge_attr as edge length
-                edge_attr = np.linalg.norm(sub_pos[subdomain_data.edge_index[0]] - sub_pos[subdomain_data.edge_index[1]], axis=1)
 
                 group = f.create_group(f'subdomain_{i}')
                 group.create_dataset('x', data=sub_x)
                 group.create_dataset('y', data=sub_y)
-                group.create_dataset('pos', data=sub_pos)
+                group.create_dataset('pos', data=subdomain_data.pos.numpy())
                 group.create_dataset('edge_index', data=subdomain_data.edge_index.numpy())
-                group.create_dataset('edge_attr', data=edge_attr)
+                group.create_dataset('edge_attr', data=subdomain_data.edge_attr.numpy())
+                group.create_dataset('global_node_ids', data=global_node_ids)
 
         print("Partitioning complete.")
 
@@ -1234,7 +1303,7 @@ class AnsysDataset(GenericGraphDataset):
 
         return mesh
     
-    def reconstruct_from_partition(self, subdomain_data_list):
+    def reconstruct_from_partition(self, subdomain_data_list, subdomain_idx):
         """
         reconstructs the original domain from a partitioned collection of subdomains
         
@@ -1242,7 +1311,7 @@ class AnsysDataset(GenericGraphDataset):
         """
         # load the partitioned data
         reader = vtk.vtkXMLPartitionedDataSetReader()
-        reader.SetFileName(os.path.join(self.root, 'partition', 'partitioned_mesh.vtpd'))
+        reader.SetFileName(os.path.join(self.root, 'partition', 'partitioned_mesh_{}.vtpd'.format(subdomain_idx)))
         reader.Update()
 
         partitioned_mesh = reader.GetOutput()
@@ -1253,12 +1322,19 @@ class AnsysDataset(GenericGraphDataset):
 
         for i in range(num_partitions):
             partition = partitioned_mesh.GetPartition(i)
-            velocity_array = vtk.vtkFloatArray()
+            # velocity_array = numpy_to_vtk(subdomain_data_list[i][:, :3].numpy(), deep=True, array_type=vtk.VTK_FLOAT)
+            # pressure_array = numpy_to_vtk(subdomain_data_list[i][:, 3].numpy(), deep=True, array_type=vtk.VTK_FLOAT)
             pressure_array = vtk.vtkFloatArray()
+            velocity_array = vtk.vtkFloatArray()
             velocity_array.SetName("velocity")
             pressure_array.SetName("pressure")
             velocity_array.SetNumberOfComponents(3)
             pressure_array.SetNumberOfComponents(1)
+
+            # check if number of nodes in subdomain_data_list[i] matches the number of points in the partition
+            if subdomain_data_list[i].shape[0] != partition.GetNumberOfPoints():
+                print(f"Warning: Subdomain {i} has {subdomain_data_list[i].shape[0]} nodes, but partition has {partition.GetNumberOfPoints()} points. Skipping.")
+                continue
 
             for row in subdomain_data_list[i][:, :3].numpy():
                 velocity_array.InsertNextTuple3(row[0], row[1], row[2])
@@ -1278,9 +1354,6 @@ class AnsysDataset(GenericGraphDataset):
         append_filter.Update()
         
         reconstructed_mesh = append_filter.GetOutput()
-
-        # smooth the velocity field
-        # reconstructed_mesh = self.smooth_vtu_with_continuity(reconstructed_mesh)
 
         return reconstructed_mesh
     
@@ -1338,7 +1411,26 @@ class AnsysDataset(GenericGraphDataset):
             return vtk_grid  # Return original grid on error
     
     def get_one_full_sample(self, idx):
-        return self
+        if not self.partition:
+            return self._data[idx]
+        else:
+            if idx >= 4:
+                raise IndexError(f"Mesh index {idx} out of range. Maximum index is 3 for 4 meshes.")
+            with h5py.File(os.path.join(self.root, 'partition', 'data.h5'), 'r') as f:
+                # get list of all subdomains as return data
+                mesh_group = f[f'mesh_{idx}']
+                data = []
+                for i in range(len(mesh_group.keys())):
+                    subdomain = f'subdomain_{i}'
+                    group = mesh_group[subdomain]
+                    x = torch.tensor(np.array(group['x']), dtype=torch.float)
+                    y = torch.tensor(np.array(group['y']), dtype=torch.float)
+                    pos = torch.tensor(np.array(group['pos']), dtype=torch.float)
+                    edge_index = torch.tensor(np.array(group['edge_index']), dtype=torch.long)
+                    edge_attr = torch.tensor(np.array(group['edge_attr']), dtype=torch.float)
+
+                    data.append(Data(x=x, y=y, pos=pos, edge_index=edge_index, edge_attr=edge_attr))
+                return data
     
 
 class SubGraphDataset(InMemoryDataset):
@@ -1907,3 +1999,198 @@ class DivergenceFreeProjection:
         plt.ylabel("Divergence Norm (log scale)")
         plt.grid()
         plt.show()
+
+
+def convert_all_mesh_arrays_to_32bit(reconstructed_mesh):
+    """
+    Convert ALL arrays in the mesh to 32-bit, including topology arrays
+    """
+    from vtkmodules.util import numpy_support
+    # Create output mesh
+    output = vtk.vtkUnstructuredGrid()
+    
+    # 1. Convert points
+    points = reconstructed_mesh.GetPoints()
+    if points:
+        points_data = points.GetData()
+        if points_data.GetDataType() == vtk.VTK_DOUBLE:
+            print("Converting points from float64 to float32...")
+            np_points = numpy_support.vtk_to_numpy(points_data)
+            points_32 = numpy_support.numpy_to_vtk(np_points.astype(np.float32), deep=False)
+            new_points = vtk.vtkPoints()
+            new_points.SetData(points_32)
+            output.SetPoints(new_points)
+        else:
+            output.SetPoints(points)
+    
+    # 2. Convert topology arrays (connectivity, offsets, faces)
+    print("Converting topology arrays...")
+    
+    # Get the cell arrays
+    cells = reconstructed_mesh.GetCells()
+    if cells:
+        # Get connectivity and offsets arrays
+        connectivity_array = cells.GetConnectivityArray()
+        offsets_array = cells.GetOffsetsArray()
+        
+        # Convert connectivity array
+        if connectivity_array and connectivity_array.GetDataType() in [vtk.VTK_LONG, vtk.VTK_LONG_LONG, vtk.VTK_ID_TYPE]:
+            print("  Converting connectivity from int64 to int32...")
+            np_conn = numpy_support.vtk_to_numpy(connectivity_array)
+            conn_32 = numpy_support.numpy_to_vtk(np_conn.astype(np.int32), deep=False)
+        else:
+            conn_32 = connectivity_array
+        
+        # Convert offsets array
+        if offsets_array and offsets_array.GetDataType() in [vtk.VTK_LONG, vtk.VTK_LONG_LONG, vtk.VTK_ID_TYPE]:
+            print("  Converting offsets from int64 to int32...")
+            np_off = numpy_support.vtk_to_numpy(offsets_array)
+            off_32 = numpy_support.numpy_to_vtk(np_off.astype(np.int32), deep=False)
+        else:
+            off_32 = offsets_array
+        
+        # Create new cell array with 32-bit arrays
+        new_cells = vtk.vtkCellArray()
+        new_cells.SetData(off_32, conn_32)
+        
+        # Set cells using the cell types from original mesh
+        output.SetCells(reconstructed_mesh.GetCellTypesArray(), new_cells)
+    
+    # 3. Handle faces array if present (for polyhedron cells)
+    faces = reconstructed_mesh.GetFaces()
+    if faces:
+        print("  Converting faces array...")
+        if faces.GetDataType() in [vtk.VTK_LONG, vtk.VTK_LONG_LONG, vtk.VTK_ID_TYPE]:
+            np_faces = numpy_support.vtk_to_numpy(faces)
+            faces_32 = numpy_support.numpy_to_vtk(np_faces.astype(np.int32), deep=False)
+            output.SetFaces(faces_32)
+        else:
+            output.SetFaces(faces)
+    
+    # 4. Handle face locations if present
+    face_locs = reconstructed_mesh.GetFaceLocations()
+    if face_locs:
+        print("  Converting face locations array...")
+        if face_locs.GetDataType() in [vtk.VTK_LONG, vtk.VTK_LONG_LONG, vtk.VTK_ID_TYPE]:
+            np_face_locs = numpy_support.vtk_to_numpy(face_locs)
+            face_locs_32 = numpy_support.numpy_to_vtk(np_face_locs.astype(np.int32), deep=False)
+            output.SetFaceLocations(face_locs_32)
+        else:
+            output.SetFaceLocations(face_locs)
+    
+    # 5. Convert point and cell data arrays
+    def convert_data_arrays(input_data, output_data):
+        if not input_data:
+            return
+            
+        for i in range(input_data.GetNumberOfArrays()):
+            array = input_data.GetArray(i)
+            if not array:
+                continue
+            
+            array_name = array.GetName()
+            data_type = array.GetDataType()
+            
+            if data_type == vtk.VTK_DOUBLE:
+                print(f"  Converting {array_name} from float64 to float32...")
+                np_array = numpy_support.vtk_to_numpy(array)
+                array_32 = numpy_support.numpy_to_vtk(np_array.astype(np.float32), deep=False)
+                array_32.SetName(array_name)
+                output_data.AddArray(array_32)
+            elif data_type in [vtk.VTK_LONG, vtk.VTK_LONG_LONG, vtk.VTK_ID_TYPE]:
+                print(f"  Converting {array_name} from int64 to int32...")
+                np_array = numpy_support.vtk_to_numpy(array)
+                array_32 = numpy_support.numpy_to_vtk(np_array.astype(np.int32), deep=False)
+                array_32.SetName(array_name)
+                output_data.AddArray(array_32)
+            else:
+                # Already 32-bit or other type
+                output_data.AddArray(array)
+    
+    print("Converting point data arrays...")
+    convert_data_arrays(reconstructed_mesh.GetPointData(), output.GetPointData())
+    
+    print("Converting cell data arrays...")
+    convert_data_arrays(reconstructed_mesh.GetCellData(), output.GetCellData())
+    
+    print("Converting field data arrays...")
+    convert_data_arrays(reconstructed_mesh.GetFieldData(), output.GetFieldData())
+    
+    return output
+
+
+# Minimal test version
+def minimal_safe_copy(mesh):
+    """
+    Most minimal safe copy - use this to debug
+    """
+    if not mesh:
+        return None
+        
+    copy = vtk.vtkUnstructuredGrid()
+    
+    # Just copy structure first
+    try:
+        copy.CopyStructure(mesh)
+        print("Structure copied successfully")
+    except Exception as e:
+        print(f"Failed to copy structure: {e}")
+        return None
+    
+    # Then copy attributes
+    try:
+        copy.CopyAttributes(mesh)
+        print("Attributes copied successfully")
+    except Exception as e:
+        print(f"Failed to copy attributes: {e}")
+        # Continue anyway - we at least have structure
+    
+    return copy
+
+
+def ultra_minimal_conversion(reconstructed_mesh):
+    """
+    Ultra-minimal conversion that modifies arrays in place where possible
+    """
+    from vtkmodules.util import numpy_support
+    
+    # Start with shallow copy
+    output = vtk.vtkUnstructuredGrid()
+    output.ShallowCopy(reconstructed_mesh)
+    
+    # Only convert the essential arrays that ParaView can't handle
+    # Convert points only if they're float64
+    if output.GetPoints() and output.GetPoints().GetData().GetDataType() == vtk.VTK_DOUBLE:
+        points_np = numpy_support.vtk_to_numpy(output.GetPoints().GetData())
+        points_32 = numpy_support.numpy_to_vtk(points_np.astype(np.float32), deep=False)
+        new_points = vtk.vtkPoints()
+        new_points.SetData(points_32)
+        output.SetPoints(new_points)
+    
+    # Only convert arrays that are problematic (float64 and int64)
+    for data_obj in [output.GetPointData(), output.GetCellData()]:
+        if not data_obj:
+            continue
+            
+        # Identify arrays that need conversion
+        arrays_to_fix = []
+        for i in range(data_obj.GetNumberOfArrays()):
+            arr = data_obj.GetArray(i)
+            if arr and arr.GetDataType() in [vtk.VTK_DOUBLE, vtk.VTK_LONG, vtk.VTK_LONG_LONG]:
+                arrays_to_fix.append(arr.GetName())
+        
+        # Convert only those arrays
+        for array_name in arrays_to_fix:
+            arr = data_obj.GetArray(array_name)
+            np_arr = numpy_support.vtk_to_numpy(arr)
+            
+            if arr.GetDataType() == vtk.VTK_DOUBLE:
+                converted = numpy_support.numpy_to_vtk(np_arr.astype(np.float32), deep=False)
+            else:  # int64 types
+                converted = numpy_support.numpy_to_vtk(np_arr.astype(np.int32), deep=False)
+            
+            converted.SetName(array_name)
+            data_obj.RemoveArray(array_name)
+            data_obj.AddArray(converted)
+    
+    return output
