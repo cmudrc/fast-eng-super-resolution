@@ -774,9 +774,11 @@ class AnsysDataset(GenericGraphDataset):
             return self._data[idx]
         else:
             mesh_idx = idx // (self.len() // 4)
+            # mesh_idx = 0
             if mesh_idx >= 4:
                 raise IndexError(f"Mesh index {mesh_idx} out of range. Maximum index is 3 for 4 meshes.")
             sub_idx = idx % 4
+            # sub_idx = idx 
             with h5py.File(os.path.join(self.root, 'partition', 'data.h5'), 'r') as f:
                 # get the group for the mesh index
                 mesh_group = f[f'mesh_{mesh_idx}']
@@ -1073,7 +1075,7 @@ class AnsysDataset(GenericGraphDataset):
 
         mesh.GetPointData().AddArray(physics_array)
 
-        mesh_spacing = 0.02  # Adjust based on your mesh scale
+        mesh_spacing = 0.012  # Adjust based on your mesh scale
         # cellLocator = vtk.vtkPointLocator()
         # cellLocator.SetDataSet(mesh)
         # cellLocator.SetTolerance(1)  # Adjust based on your mesh scale
@@ -1303,59 +1305,108 @@ class AnsysDataset(GenericGraphDataset):
 
         return mesh
     
-    def reconstruct_from_partition(self, subdomain_data_list, subdomain_idx):
+    def reconstruct_from_partition(self, subdomain_data_list, subdomain_ref_list, subdomain_idx):
         """
-        reconstructs the original domain from a partitioned collection of subdomains
-        
-        :param subdomains: a list of subdomains, each stored in a torch_geometric.data.Data object
-        """
-        # load the partitioned data
-        reader = vtk.vtkXMLPartitionedDataSetReader()
-        reader.SetFileName(os.path.join(self.root, 'partition', 'partitioned_mesh_{}.vtpd'.format(subdomain_idx)))
-        reader.Update()
+        Reconstructs the original domain from a partitioned collection of subdomains,
+        and averages vtkPointData (e.g., velocity, pressure) across overlapping points.
 
+        :param subdomain_data_list: list of torch tensors, each with shape [N, 4] (vx, vy, vz, pressure)
+        :param subdomain_ref_list: list of torch tensors with same shape, used for reference values
+        :param subdomain_idx: index of the partition file to load
+        :return: vtkUnstructuredGrid
+        """
+
+        reader = vtk.vtkXMLPartitionedDataSetReader()
+        reader.SetFileName(os.path.join(self.root, 'partition', f'partitioned_mesh_{subdomain_idx}.vtpd'))
+        reader.Update()
         partitioned_mesh = reader.GetOutput()
 
         append_filter = vtk.vtkAppendDataSets()
-        # append_filter.SetMergePoints(True)
         num_partitions = partitioned_mesh.GetNumberOfPartitions()
 
         for i in range(num_partitions):
             partition = partitioned_mesh.GetPartition(i)
-            # velocity_array = numpy_to_vtk(subdomain_data_list[i][:, :3].numpy(), deep=True, array_type=vtk.VTK_FLOAT)
-            # pressure_array = numpy_to_vtk(subdomain_data_list[i][:, 3].numpy(), deep=True, array_type=vtk.VTK_FLOAT)
-            pressure_array = vtk.vtkFloatArray()
-            velocity_array = vtk.vtkFloatArray()
-            velocity_array.SetName("velocity")
-            pressure_array.SetName("pressure")
-            velocity_array.SetNumberOfComponents(3)
-            pressure_array.SetNumberOfComponents(1)
 
-            # check if number of nodes in subdomain_data_list[i] matches the number of points in the partition
-            if subdomain_data_list[i].shape[0] != partition.GetNumberOfPoints():
-                print(f"Warning: Subdomain {i} has {subdomain_data_list[i].shape[0]} nodes, but partition has {partition.GetNumberOfPoints()} points. Skipping.")
+            if not partition or subdomain_data_list[i].shape[0] != partition.GetNumberOfPoints():
+                print(f"Warning: Skipping partition {i} due to mismatch or empty.")
                 continue
 
+            velocity_array = vtk.vtkFloatArray()
+            velocity_array.SetName("velocity")
+            velocity_array.SetNumberOfComponents(3)
+
+            pressure_array = vtk.vtkFloatArray()
+            pressure_array.SetName("pressure")
+            pressure_array.SetNumberOfComponents(1)
+
+            ref_velocity_array = vtk.vtkFloatArray()
+            ref_velocity_array.SetName("ref_velocity")
+            ref_velocity_array.SetNumberOfComponents(3)
+
+            ref_pressure_array = vtk.vtkFloatArray()
+            ref_pressure_array.SetName("ref_pressure")
+            ref_pressure_array.SetNumberOfComponents(1)
+
             for row in subdomain_data_list[i][:, :3].numpy():
-                velocity_array.InsertNextTuple3(row[0], row[1], row[2])
-            for value in subdomain_data_list[i][:, 3].numpy():
-                pressure_array.InsertNextTuple1(value)
+                velocity_array.InsertNextTuple3(*row)
+            for val in subdomain_data_list[i][:, 3].numpy():
+                pressure_array.InsertNextTuple1(val)
+
+            for row in subdomain_ref_list[i][:, :3].numpy():
+                ref_velocity_array.InsertNextTuple3(*row)
+            for val in subdomain_ref_list[i][:, 3].numpy():
+                ref_pressure_array.InsertNextTuple1(val)
 
             partition.GetPointData().AddArray(velocity_array)
             partition.GetPointData().AddArray(pressure_array)
+            partition.GetPointData().AddArray(ref_velocity_array)
+            partition.GetPointData().AddArray(ref_pressure_array)
 
-            if not partition:
-                print(f"Warning: Partition {i} is empty. Skipping.")
-                continue
-
-            # Create a VTK unstructured grid from the subdomain data
             append_filter.AddInputData(partition)
 
         append_filter.Update()
-        
-        reconstructed_mesh = append_filter.GetOutput()
+        merged_grid = append_filter.GetOutput()
 
-        return reconstructed_mesh
+        # --- AVERAGING LOGIC BELOW ---
+        locator = vtk.vtkStaticPointLocator()
+        locator.SetDataSet(merged_grid)
+        locator.AutomaticOn()
+        locator.BuildLocator()
+
+        num_points = merged_grid.GetNumberOfPoints()
+        visited = np.zeros(num_points, dtype=bool)
+
+        point_data = merged_grid.GetPointData()
+        array_names = [point_data.GetArrayName(i) for i in range(point_data.GetNumberOfArrays())]
+        array_np = {name: vtk_to_numpy(point_data.GetArray(name)) for name in array_names}
+
+        for i in range(num_points):
+            if visited[i]:
+                continue
+
+            neighbors = vtk.vtkIdList()
+            locator.FindPointsWithinRadius(1e-6, merged_grid.GetPoint(i), neighbors)
+            idxs = [neighbors.GetId(j) for j in range(neighbors.GetNumberOfIds())]
+
+            if len(idxs) == 1:
+                visited[i] = True
+                continue
+
+            visited[idxs] = True
+            for name in array_names:
+                sub_vals = array_np[name][idxs]
+                mean_val = np.mean(sub_vals, axis=0)
+                for idx in idxs:
+                    array_np[name][idx] = mean_val
+
+        for name in array_names:
+            averaged_array = numpy_to_vtk(array_np[name], deep=True)
+            averaged_array.SetName(name)
+            point_data.RemoveArray(name)
+            point_data.AddArray(averaged_array)
+
+        merged_grid.Modified()
+        return merged_grid
     
     
     def smooth_vtu_with_continuity(self, vtk_grid, 

@@ -6,7 +6,7 @@ from torch.utils.data import random_split
 import torch.nn as nn
 import torch.distributed as dist
 import torch.multiprocessing as mp
-# import torch_geometric as pyg
+import torch_geometric as pyg
 # import torch_geometric.nn as pyg_nn    
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn.inits import reset, uniform
@@ -121,7 +121,7 @@ class GNNPartitionScheduler():
                 # else:
                 #     model = model.to(device)
 
-                criterion = torch.nn.MSELoss()
+                criterion = GradientbasedLoss().to(device)
                 optimizer = torch.optim.Adam(model.parameters(), lr=train_config['lr'])
                 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
                 epochs = train_config['epochs']
@@ -189,6 +189,7 @@ class GNNPartitionScheduler():
 
     def predict(self, x):
         pred_y_list = []
+        ref_y_list = [data.y for data in x]
         for model in self.models:
             model.eval()
             with torch.no_grad():
@@ -234,7 +235,7 @@ class GNNPartitionScheduler():
                         x_data = x_data.to('cuda')
                         pred_y = model(x_data.x, x_data.edge_index, x_data.edge_attr)
                         pred_y_list.append(pred_y)
-        return pred_y_list
+        return pred_y_list, ref_y_list
     
     @staticmethod
     def _predict_sub_models_parallel(rank, model, x_local, results, world_size):
@@ -299,7 +300,7 @@ class GNNPartitionScheduler():
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank])
 
         # Set up optimizer, criterion, and scheduler
-        criterion = torch.nn.MSELoss()
+        criterion = GradientbasedLoss(max_weight=10).to(local_device)
         optimizer = torch.optim.Adam(model.parameters(), lr=train_config['lr'])
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer, step_size=train_config['step_size'], gamma=train_config['gamma']
@@ -314,7 +315,7 @@ class GNNPartitionScheduler():
                 optimizer.zero_grad()
                 batch = batch.to(local_device)
                 out = model(batch.x, batch.edge_index, batch.edge_attr)
-                loss = criterion(out, batch.y) 
+                loss = criterion(out, batch.y, batch.edge_index, batch.edge_attr) 
                 # wandb.log({'train_loss': loss.item()})
                 loss.backward()
                 # log gradient during training
@@ -342,7 +343,7 @@ class GNNPartitionScheduler():
                         batch = batch.to(local_device)
                         out = model(batch.x, batch.edge_index, batch.edge_attr)
                         # print(out.shape)
-                        loss = criterion(out, batch.y)
+                        loss = criterion(out, batch.y, batch.edge_index, batch.edge_attr)
                         val_loss += loss.item()
                     val_loss /= len(val_loader)
                     if rank == 0:
@@ -377,3 +378,32 @@ class GNNPartitionScheduler():
         if rank == 0:
             torch.save(models[0].module.state_dict(), 'logs/models/collection_{}/partition_{}.pth'.format(name, 0))
         return models
+
+
+class GradientbasedLoss(nn.Module):
+    """
+    Custom loss function that computes the gradient-based loss. For physics domain, the gradient-based loss assigns more weight to regions with high gradients.
+    It is used to train the model to focus on regions with high gradients (more variant physics dynamics).
+    """
+    def __init__(self, max_weight=1.0):
+        super(GradientbasedLoss, self).__init__()
+        self.max_weight = max_weight
+
+    def forward(self, pred: torch.Tensor, data: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor):
+        # Compute the gradient of the prediction by node physics values divided by edge_attr
+        grad_pred = (pred[edge_index[0]] - pred[edge_index[1]]) / (edge_attr + 1e-10)
+        grad_data = (data[edge_index[0]] - data[edge_index[1]]) / (edge_attr + 1e-10)
+        # Compute the loss weighted by the computed gradients
+        edge_weight = torch.norm(grad_pred - grad_data, dim=1)
+        # Compute the node weight as sum of edge weights for each node
+        node_weight = torch.zeros(pred.shape[0], device=pred.device)
+        node_weight.scatter_add_(0, edge_index[0], edge_weight)
+        node_weight.scatter_add_(0, edge_index[1], edge_weight)
+        # Normalize the node weight
+        node_weight = node_weight / (torch.linalg.norm(node_weight, dim=0) + 1e-10) * self.max_weight
+        # Compute the loss as the mean squared error between the prediction and data
+        loss = torch.mean((pred - data) ** 2, dim=1)
+        # Apply the node weight to the loss
+        loss = loss * (node_weight + 1) # Add 1 to avoid zero weight at nodes with no gradient
+        # Apply the weight to the loss
+        return torch.sum(loss) 

@@ -11,7 +11,7 @@ domain_size: 0.03
 # model configs
 in_channels: 4
 out_channels: 4
-width: 64
+width: 48
 num_powers: 3
 retrieve_weight: False
 # latent_dim: 128
@@ -23,8 +23,8 @@ num_layers: 5
 # data configs
 root: 'data/ansys'
 partition: True
-sub_size: 500
+sub_size: 1000
 
 # pred configs
-idxs: [0]
+idxs: [2]
 timesteps: 20

@@ -17,13 +17,13 @@ def pred_graph_ALDD(idxs, exp_name, model, dataset, num_partitions, save_mode, *
         x = dataset.get_one_full_sample(idx)
 
         time_start = time.time()
-        pred_y_list = scheduler.predict(x)
+        pred_y_list, ref_y_list = scheduler.predict(x)
         time_end = time.time()
 
         print(f'Prediction time: {time_end - time_start}')
         
         time_start = time.time()
-        pred_y = dataset.reconstruct_from_partition(pred_y_list, idx)
+        pred_y = dataset.reconstruct_from_partition(pred_y_list, ref_y_list, idx)
         time_end = time.time()
 
         print(f'Reconstruction time: {time_end - time_start}')
