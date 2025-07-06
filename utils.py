@@ -2,6 +2,8 @@ import os
 import argparse
 import time
 from models.model import *
+from models.encoder import *
+from models.classifier import *
 # from models.scheduler import *
 # from deepxde.nn.pytorch import DeepONet
 from dataset.GraphDataset import *
@@ -48,6 +50,28 @@ def init_dataset(name, **kwargs):
         return AnsysDataset(**kwargs)
     else:
         raise ValueError(f'Invalid dataset name: {name}')
+    
+
+def init_encoder(type, n_components, **kwargs):
+    if type == 'pca':
+        return PCAEncoder(n_components=n_components)
+    elif type == 'vae':
+        return VAEEncoder(n_components=n_components, **kwargs)
+    elif type == 'spectrum':
+        return SpectrumEncoder(n_components=n_components, **kwargs)
+    else:
+        raise ValueError(f'Invalid encoder type: {type}')
+    
+
+def init_classifier(type, n_clusters, **kwargs):
+    if type == 'kmeans':
+        return KMeansClassifier(n_clusters=n_clusters)
+    if type == 'mean_shift':
+        return MeanShiftClassifier()
+    if type == 'wasserstein':
+        return WassersteinKMeansClassifier(n_clusters=n_clusters)
+    else:
+        raise ValueError(f'Invalid classifier type: {type}')
 
 
 def parse_args():
@@ -55,9 +79,9 @@ def parse_args():
     parser.add_argument('--dataset', type=str, default='ansys', help='Name of the dataset')
     parser.add_argument('--encoder', type=str, default='pca', help='Name of the encoder')
     parser.add_argument('--classifier', type=str, default='kmeans', help='Name of the classifier')
-    parser.add_argument('--model', type=str, default='teecnet', help='Name of the model')
-    parser.add_argument('--exp_name', type=str, default='ansys_teecnet', help='Name of the experiment')
-    parser.add_argument('--mode', type=str, default='train', help='Mode of the experiment')
+    parser.add_argument('--model', type=str, default='neuralop', help='Name of the model')
+    parser.add_argument('--exp_name', type=str, default='ansys_neuralop', help='Name of the experiment')
+    parser.add_argument('--mode', type=str, default='pred', help='Mode of the experiment')
     parser.add_argument('--exp_config', type=str, default='configs/exp_config/teecnet_ansys.yaml', help='Path to the experiment configuration file')
     parser.add_argument('--train_config', type=str, default='configs/train_config/teecnet.yaml', help='Path to the training configuration file')
     args = parser.parse_args()
